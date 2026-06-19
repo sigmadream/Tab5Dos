@@ -1,0 +1,16 @@
+# TabDOS needs external RAM for the 1 MiB PC RAM plus LCD staging buffers.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# The tested Tab5 reports ESP32-P4 revision v1.3. ESP-IDF defaults to
+# rev >=3.1 binaries, which the bootloader refuses to flash/run on v1.x chips.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# The observed Tab5 flash reports 16 MB; keep the image header aligned with
+# the board to avoid boot-time flash-size warnings.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
