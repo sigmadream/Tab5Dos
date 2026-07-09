@@ -44,6 +44,10 @@ public:
   int columns() const { return m_columns; }
   int cellHeight() const { return m_cellHeight; }
   int rows() const { return m_rows; }
+  // Hash of all state that affects rendered output, so the display layer can
+  // detect "nothing changed" from the inputs (text buffer + this) instead of
+  // re-rendering the frame and hashing the pixels.
+  uint64_t stateHash() const;
   uint8_t sampleColorIndex(uint8_t const * textBuffer, int x, int y) const;
 
   void renderLine(uint8_t const * textBuffer, int y, uint16_t * dest) const;

@@ -29,6 +29,7 @@ public:
   typedef uint8_t (*ReadVideoMemory8)(void * context, int address);
   typedef uint16_t (*ReadVideoMemory16)(void * context, int address);
   typedef bool (*Interrupt)(void * context, int num);
+  typedef void (*UnsupportedOpcode)(void * context, uint16_t cs, uint16_t ip, uint8_t op0, uint8_t op1);
 
 
   static void setCallbacks(void * context, ReadPort readPort, WritePort writePort, WriteVideoMemory8 writeVideoMemory8, WriteVideoMemory16 writeVideoMemory16, ReadVideoMemory8 readVideoMemory8, ReadVideoMemory16 readVideoMemory16,Interrupt interrupt) {
@@ -43,6 +44,26 @@ public:
   }
 
   static void setMemory(uint8_t * memory) { s_memory = memory; }
+
+  // Redirect a byte-addressed window (used for the EMS page frame) to callbacks
+  // instead of flat RAM, so mapped expanded-memory pages resolve to their pool
+  // backing on every access. When inactive (no pages mapped) the fast path pays
+  // only a single predicted-false test. read/write use the ReadPort/WritePort
+  // byte callback signatures.
+  static void setEmsWindow(uint32_t base, uint32_t end, ReadPort read, WritePort write)
+  {
+    s_emsBase = base;
+    s_emsEnd = end;
+    s_emsRead = read;
+    s_emsWrite = write;
+  }
+  static void setEmsWindowActive(bool active) { s_emsActive = active; }
+
+  // Optional hook invoked when the decoder hits an opcode it does not implement,
+  // reporting the faulting CS:IP and the first two instruction bytes for
+  // diagnostics. Skipping such an opcode can desynchronize the stream, so this
+  // makes the fault visible instead of silent.
+  static void setUnsupportedOpcodeHandler(UnsupportedOpcode handler) { s_unsupportedOpcode = handler; }
 
   static void reset();
 
@@ -109,6 +130,13 @@ public:
 
   static bool halted()                                    { return s_halted; }
 
+  // When enabled, PUSHF/store-flags leave FLAGS bits 12-15 clear so guest CPU
+  // detection code identifies an 80186/80286-class part instead of an 8086.
+  // Early-90s titles (e.g. Uncharted Waters 2) refuse to run on a detected 8086
+  // even though this core implements the required 80186 instruction set.
+  static void setReportAbove8086(bool enable)             { s_reportAbove8086 = enable; }
+  static bool reportAbove8086()                           { return s_reportAbove8086; }
+
   static bool IRQ(uint8_t interrupt_num);
   static void triggerInterrupt(uint8_t interrupt_num);
 
@@ -145,6 +173,13 @@ private:
   static uint8_t            s_pendingIRQIndex;
   static uint8_t *          s_memory;
   static bool               s_halted;
+  static bool               s_reportAbove8086;
+  static UnsupportedOpcode  s_unsupportedOpcode;
+  static bool               s_emsActive;
+  static uint32_t           s_emsBase;
+  static uint32_t           s_emsEnd;
+  static ReadPort           s_emsRead;
+  static WritePort          s_emsWrite;
 
 };
 

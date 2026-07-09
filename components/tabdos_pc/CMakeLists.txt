@@ -9,6 +9,7 @@ idf_component_register(
         "${TABDOS_PC_ROOT}/pc_i8086.cpp"
         "${TABDOS_PC_ROOT}/pc_keyboard_controller.cpp"
         "${TABDOS_PC_ROOT}/pc_machine.cpp"
+        "${TABDOS_PC_ROOT}/pc_opl2.cpp"
         "${TABDOS_PC_ROOT}/pc_text_renderer.cpp"
     INCLUDE_DIRS
         "${TABDOS_PC_ROOT}"

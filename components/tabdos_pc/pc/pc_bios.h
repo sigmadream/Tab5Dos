@@ -8,11 +8,36 @@ class PcMachine;
 
 class PcBios {
 public:
+  // Snapshot of the INT 33h cursor state needed to draw the pointer overlay.
+  // Coordinates are in the DOS virtual mouse range [min,max]; the display layer
+  // maps them to source pixels. When graphicsCursorDefined is false the caller
+  // should draw the built-in arrow (screenMask/cursorMask still hold it).
+  struct MouseRenderInfo {
+    bool visible;
+    uint16_t x;
+    uint16_t y;
+    uint16_t minX;
+    uint16_t maxX;
+    uint16_t minY;
+    uint16_t maxY;
+    bool graphicsCursorDefined;
+    int hotspotX;
+    int hotspotY;
+    uint16_t screenMask[16];
+    uint16_t cursorMask[16];
+    bool excludeActive;
+    uint16_t excludeLeft;
+    uint16_t excludeTop;
+    uint16_t excludeRight;
+    uint16_t excludeBottom;
+  };
+
   void reset();
   bool handleInterrupt(PcMachine & machine, int interruptNumber);
   void setMouseInstalled(bool installed);
   void setMouseState(uint16_t x, uint16_t y, uint16_t buttons);
   void setMouseSourceState(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t buttons);
+  MouseRenderInfo mouseRenderInfo() const;
   bool dispatchMouseCallback(PcMachine & machine);
   uint32_t timerDayTicks() const;
   void updateTimerBda(PcMachine & machine) const;
@@ -26,7 +51,8 @@ private:
   bool handleTimerInterrupt(PcMachine & machine);
   bool handleSystemInterrupt(PcMachine & machine);
   bool handleClockInterrupt();
-  bool handleMouseInterrupt();
+  bool handleMouseInterrupt(PcMachine & machine);
+  void loadDefaultGraphicsCursor();
   bool saveVideoState(PcMachine & machine, uint32_t buffer, uint16_t stateMask);
   bool restoreVideoState(PcMachine & machine, uint32_t buffer, uint16_t stateMask);
   void clampMousePosition();
@@ -37,6 +63,7 @@ private:
   static uint8_t toBcd(int value);
   void updateKeyboardFlags(PcMachine & machine);
   bool translateKeyboardScancode(PcMachine & machine, uint8_t rawScancode, uint16_t * key);
+  void flushShadowKey(PcMachine & machine);
   bool fetchKey(PcMachine & machine, uint16_t * key);
   bool peekBdaKey(PcMachine & machine, uint16_t * key);
   bool popBdaKey(PcMachine & machine, uint16_t * key);
@@ -119,6 +146,31 @@ private:
   int16_t m_mousePendingCallbackMotionX = 0;
   int16_t m_mousePendingCallbackMotionY = 0;
   bool m_mouseInstalled = false;
+  // Deferred shadow keyboard translation (see observeKeyboardScancode).
+  bool m_shadowKeyPending = false;
+  uint16_t m_shadowKey = 0;
+  uint16_t m_shadowTailAtObserve = 0;
+  // INT 15h AH=86h waits, keyed by the caller's {CS, IP, SP} so a wait issued
+  // from a nested interrupt handler does not adopt or reset an outer wait.
+  struct BiosWait {
+    bool active = false;
+    uint16_t cs = 0;
+    uint16_t ip = 0;
+    uint16_t sp = 0;
+    uint64_t targetMicros = 0;
+  };
+  static constexpr int WaitSlots = 8;
+  BiosWait m_waits[WaitSlots];
+  bool m_mouseGraphicsCursorDefined = false;
+  int m_mouseHotspotX = 0;
+  int m_mouseHotspotY = 0;
+  uint16_t m_mouseScreenMask[16] = {};
+  uint16_t m_mouseCursorMask[16] = {};
+  bool m_mouseExcludeActive = false;
+  uint16_t m_mouseExcludeLeft = 0;
+  uint16_t m_mouseExcludeTop = 0;
+  uint16_t m_mouseExcludeRight = 0;
+  uint16_t m_mouseExcludeBottom = 0;
   uint32_t m_timerBaseTicks = 0;
   uint64_t m_timerBaseMillis = 0;
 };

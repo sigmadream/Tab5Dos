@@ -138,6 +138,12 @@ static uint64_t monotonicMilliseconds()
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch()).count());
 }
 
+static uint64_t monotonicMicroseconds()
+{
+  using clock = std::chrono::steady_clock;
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(clock::now().time_since_epoch()).count());
+}
+
 static void writeIndexedRegister(PcMachine & machine, uint16_t indexPort, uint16_t dataPort, uint8_t index, uint8_t value)
 {
   machine.writePort(indexPort, index);
@@ -580,9 +586,58 @@ void PcBios::reset()
   m_mouseVisibleCount = 0;
   m_mouseButtons = 0;
   clearMouseEventState();
+  loadDefaultGraphicsCursor();
+  m_mouseExcludeActive = false;
   m_mouseInstalled = false;
+  m_shadowKeyPending = false;
+  m_shadowKey = 0;
+  m_shadowTailAtObserve = 0;
+  for (int i = 0; i < WaitSlots; ++i)
+    m_waits[i] = BiosWait{};
   m_timerBaseTicks = 0;
   m_timerBaseMillis = monotonicMilliseconds();
+}
+
+void PcBios::loadDefaultGraphicsCursor()
+{
+  // Standard Microsoft-compatible arrow pointer (hotspot at the top-left tip).
+  // screenMask is ANDed with the background, cursorMask is XORed afterwards.
+  static const uint16_t kArrowScreenMask[16] = {
+    0x3fff, 0x1fff, 0x0fff, 0x07ff, 0x03ff, 0x01ff, 0x00ff, 0x007f,
+    0x003f, 0x001f, 0x01ff, 0x10ff, 0x30ff, 0xf87f, 0xf87f, 0xfc7f,
+  };
+  static const uint16_t kArrowCursorMask[16] = {
+    0x0000, 0x4000, 0x6000, 0x7000, 0x7800, 0x7c00, 0x7e00, 0x7f00,
+    0x7f80, 0x7c00, 0x6c00, 0x4600, 0x0600, 0x0300, 0x0300, 0x0000,
+  };
+  memcpy(m_mouseScreenMask, kArrowScreenMask, sizeof(m_mouseScreenMask));
+  memcpy(m_mouseCursorMask, kArrowCursorMask, sizeof(m_mouseCursorMask));
+  m_mouseHotspotX = 0;
+  m_mouseHotspotY = 0;
+  m_mouseGraphicsCursorDefined = false;
+}
+
+PcBios::MouseRenderInfo PcBios::mouseRenderInfo() const
+{
+  MouseRenderInfo info = {};
+  info.visible = m_mouseInstalled && m_mouseVisibleCount > 0;
+  info.x = m_mouseX;
+  info.y = m_mouseY;
+  info.minX = m_mouseMinX;
+  info.maxX = m_mouseMaxX;
+  info.minY = m_mouseMinY;
+  info.maxY = m_mouseMaxY;
+  info.graphicsCursorDefined = m_mouseGraphicsCursorDefined;
+  info.hotspotX = m_mouseHotspotX;
+  info.hotspotY = m_mouseHotspotY;
+  memcpy(info.screenMask, m_mouseScreenMask, sizeof(info.screenMask));
+  memcpy(info.cursorMask, m_mouseCursorMask, sizeof(info.cursorMask));
+  info.excludeActive = m_mouseExcludeActive;
+  info.excludeLeft = m_mouseExcludeLeft;
+  info.excludeTop = m_mouseExcludeTop;
+  info.excludeRight = m_mouseExcludeRight;
+  info.excludeBottom = m_mouseExcludeBottom;
+  return info;
 }
 
 void PcBios::setMouseInstalled(bool installed)
@@ -773,9 +828,34 @@ bool PcBios::handleTimerInterrupt(PcMachine & machine)
 
 void PcBios::observeKeyboardScancode(PcMachine & machine, uint8_t rawScancode)
 {
+  // This shadow translation runs while a guest INT 09h handler reads port 0x60
+  // (the BIOS-default path never gets here). Two handler styles exist and we
+  // cannot tell them apart up front:
+  //   * "chaining" handlers read the scancode then jump to the BIOS; the BIOS
+  //     can no longer re-read the consumed byte, so the BDA relies on us.
+  //   * "complete" handlers (e.g. QBASIC's editor) translate and fill the BDA
+  //     themselves; shadowing them too would double every key.
+  // So we DEFER: remember the translated key and the BDA tail now, then flush it
+  // only when the key is actually consumed (flushShadowKey) and only if the
+  // guest handler did not advance the tail itself. This gives exactly one BDA
+  // entry per key for both handler styles.
+  flushShadowKey(machine); // resolve any previously observed key first
   uint16_t key = 0;
-  if (translateKeyboardScancode(machine, rawScancode, &key))
-    storeBdaKey(machine, key);
+  if (translateKeyboardScancode(machine, rawScancode, &key)) {
+    m_shadowKey = key;
+    m_shadowKeyPending = true;
+    m_shadowTailAtObserve = machine.readMemory16(0x041c); // BDA keyboard buffer tail
+  }
+}
+
+void PcBios::flushShadowKey(PcMachine & machine)
+{
+  if (!m_shadowKeyPending)
+    return;
+  m_shadowKeyPending = false;
+  // If the tail moved, the guest handler already stored this key; don't double it.
+  if (machine.readMemory16(0x041c) == m_shadowTailAtObserve)
+    storeBdaKey(machine, m_shadowKey);
 }
 
 bool PcBios::handleInterrupt(PcMachine & machine, int interruptNumber)
@@ -897,7 +977,9 @@ bool PcBios::handleInterrupt(PcMachine & machine, int interruptNumber)
       writeTeletype(machine, PcI8086::AL(), 0x07);
       return true;
     case 0x33:
-      return handleMouseInterrupt();
+      return handleMouseInterrupt(machine);
+    case 0x67:
+      return machine.handleEmsInterrupt();
     default:
       return false;
   }
@@ -2063,6 +2145,48 @@ bool PcBios::handleSystemInterrupt(PcMachine & machine)
       PcI8086::setAX(0x0000); // PcMachine exposes a 1 MiB real-mode address space only
       PcI8086::setFlagCF(false);
       return true;
+    case 0x86: // wait CX:DX microseconds
+    {
+      uint16_t const cs = PcI8086::CS();
+      uint16_t const ip = PcI8086::IP();
+      uint16_t const sp = PcI8086::SP();
+      uint64_t const now = monotonicMicroseconds();
+
+      // Find the wait belonging to this exact call context, or start a new one.
+      // Keying on {CS, IP, SP} keeps a wait re-entered from a nested interrupt
+      // handler independent of the outer wait that it interrupted.
+      int slot = -1;
+      for (int i = 0; i < WaitSlots; ++i) {
+        if (m_waits[i].active && m_waits[i].cs == cs && m_waits[i].ip == ip && m_waits[i].sp == sp) {
+          slot = i;
+          break;
+        }
+      }
+      if (slot < 0) {
+        uint64_t const micros = (static_cast<uint64_t>(PcI8086::CX()) << 16) | PcI8086::DX();
+        for (int i = 0; i < WaitSlots; ++i) {
+          if (!m_waits[i].active) {
+            slot = i;
+            break;
+          }
+        }
+        if (slot < 0)
+          slot = 0; // all slots busy (deeper nesting than expected): reuse slot 0
+        m_waits[slot] = BiosWait{true, cs, ip, sp, now + micros};
+      }
+
+      if (now < m_waits[slot].targetMicros) {
+        // Re-execute the INT 15h so the wait yields back to the emulator loop
+        // (letting the timer IRQ and other tasks run) rather than spinning with
+        // the machine mutex held for the whole delay.
+        PcI8086::setIP(static_cast<uint16_t>(PcI8086::IP() - 2));
+        return true;
+      }
+      m_waits[slot].active = false;
+      PcI8086::setAH(0x00);
+      PcI8086::setFlagCF(false); // CF clear: the wait completed
+      return true;
+    }
     case 0x24: // A20 gate services
       switch (PcI8086::AL()) {
         case 0x00: // disable A20
@@ -2223,7 +2347,7 @@ bool PcBios::handleClockInterrupt()
   }
 }
 
-bool PcBios::handleMouseInterrupt()
+bool PcBios::handleMouseInterrupt(PcMachine & machine)
 {
   switch (PcI8086::AX()) {
     case 0x0000: // reset driver and read installed flag
@@ -2236,11 +2360,19 @@ bool PcBios::handleMouseInterrupt()
       m_mouseMinY = 0;
       m_mouseMaxY = 199;
       clearMouseEventState();
+      loadDefaultGraphicsCursor();
+      m_mouseExcludeActive = false;
       PcI8086::setAX(m_mouseInstalled ? 0xffff : 0x0000);
       PcI8086::setBX(m_mouseInstalled ? 0x0002 : 0x0000);
       return true;
     case 0x0001: // show cursor
-      ++m_mouseVisibleCount;
+      // A real Microsoft driver caps the internal show counter at the visible
+      // state, so redundant show calls do not stack; a single hide then always
+      // removes the pointer. Here visibility is m_mouseVisibleCount > 0, so cap
+      // the counter at 1 instead of letting it grow without bound.
+      if (m_mouseVisibleCount < 1)
+        ++m_mouseVisibleCount;
+      m_mouseExcludeActive = false; // showing the cursor clears any conditional-off region
       return true;
     case 0x0002: // hide cursor
       if (m_mouseVisibleCount > 0)
@@ -2297,10 +2429,29 @@ bool PcBios::handleMouseInterrupt()
       m_mouseCallbackSegment = PcI8086::ES();
       m_mouseCallbackOffset = PcI8086::DX();
       return true;
-    case 0x0009: // define graphics cursor
+    case 0x0009: // define graphics cursor (BX/CX = hotspot, ES:DX = 16 words screen mask + 16 words cursor mask)
+    {
+      m_mouseHotspotX = static_cast<int16_t>(PcI8086::BX());
+      m_mouseHotspotY = static_cast<int16_t>(PcI8086::CX());
+      uint32_t const source = linearAddress(PcI8086::ES(), PcI8086::DX());
+      if (machine.isRamRangeValid(source, 64)) {
+        for (int i = 0; i < 16; ++i)
+          m_mouseScreenMask[i] = machine.readMemory16(source + i * 2);
+        for (int i = 0; i < 16; ++i)
+          m_mouseCursorMask[i] = machine.readMemory16(source + 32 + i * 2);
+        m_mouseGraphicsCursorDefined = true;
+      }
+      return true;
+    }
+    case 0x0010: // set conditional off (exclusion) region: CX,DX = upper-left, SI,DI = lower-right
+      m_mouseExcludeLeft = PcI8086::CX();
+      m_mouseExcludeTop = PcI8086::DX();
+      m_mouseExcludeRight = PcI8086::SI();
+      m_mouseExcludeBottom = PcI8086::DI();
+      m_mouseExcludeActive = true;
+      return true;
     case 0x000a: // define text cursor
     case 0x000f: // set mickey/pixel ratio
-    case 0x0010: // set conditional off region
     case 0x0013: // set double-speed threshold
     case 0x001a: // set sensitivity
     case 0x001d: // set display page
@@ -2456,6 +2607,9 @@ bool PcBios::fetchKey(PcMachine & machine, uint16_t * key)
 
 bool PcBios::peekBdaKey(PcMachine & machine, uint16_t * key)
 {
+  // Resolve any deferred shadow key at the moment it is about to be consumed,
+  // now that the guest INT 09h handler has had its chance to fill the BDA.
+  flushShadowKey(machine);
   uint16_t head = machine.readMemory16(0x041a);
   uint16_t tail = machine.readMemory16(0x041c);
   if (head < 0x001e || head >= 0x003e) {

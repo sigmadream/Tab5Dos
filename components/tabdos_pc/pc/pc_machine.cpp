@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <chrono>
 
 #if defined(ESP_PLATFORM)
 #include "esp_heap_caps.h"
@@ -13,6 +14,15 @@ namespace tabdos {
 extern const uint8_t PcFont8x16Data[4096];
 
 namespace {
+
+constexpr uint32_t PitInputHz = 1193182; // 8253/8254 input clock
+
+uint64_t monotonicMicroseconds()
+{
+  using clock = std::chrono::steady_clock;
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(clock::now().time_since_epoch()).count());
+}
 
 constexpr uint16_t BiosKeyboardIrqSegment = 0xf000;
 constexpr uint16_t BiosKeyboardIrqOffset = 0xf100;
@@ -148,14 +158,28 @@ static uint8_t normalizeVgaFeatureControl(uint8_t value)
 
 static uint8_t nextColorDisplayStatusBits(uint8_t & phase)
 {
-  static uint8_t constexpr phases[4] = {
-    0x01, // active display
-    0x00, // horizontal blank
-    0x01, // active display
-    0x08, // vertical retrace
-  };
-  phase = static_cast<uint8_t>((phase + 1) & 0x03);
-  return phases[phase & 0x03];
+  // CGA/VGA input status register 1 (3DAh/3BAh) retrace bits, derived from
+  // wall-clock time so that guest loops which poll bit 3 to synchronize to the
+  // vertical retrace (palette fades, page flips) see a stable ~60 Hz cadence
+  // instead of a value that only advances when the port is read.
+  constexpr uint64_t kFrameMicros = 16667;      // ~60 Hz refresh
+  constexpr uint64_t kVerticalRetraceMicros = 1400; // trailing VBlank window
+  constexpr uint64_t kScanlineMicros = 32;      // ~31.77 us per scanline
+  constexpr uint64_t kHorizontalBlankMicros = 8; // trailing HBlank per line
+
+  uint64_t const now = monotonicMicroseconds();
+  uint64_t const frameOffset = now % kFrameMicros;
+  bool const verticalRetrace = frameOffset >= (kFrameMicros - kVerticalRetraceMicros);
+  uint64_t const lineOffset = frameOffset % kScanlineMicros;
+  bool const horizontalBlank = lineOffset >= (kScanlineMicros - kHorizontalBlankMicros);
+
+  phase = static_cast<uint8_t>((phase + 1) & 0x03); // keep toggling for legacy probes
+  uint8_t bits = 0;
+  if (verticalRetrace || horizontalBlank)
+    bits |= 0x01; // display-enable off (in blanking): safe to touch video RAM
+  if (verticalRetrace)
+    bits |= 0x08; // vertical retrace active
+  return bits;
 }
 
 static uint16_t vgaVerticalDisplayEndForMode(PcMachine::VideoMode mode)
@@ -268,6 +292,16 @@ PcMachine::PcMachine()
   : m_ram(nullptr),
     m_videoMemory(nullptr),
     m_vgaPlaneMemory(nullptr),
+    m_emsPool(nullptr),
+    m_emsPageOwner(),
+    m_emsHandleActive(),
+    m_emsHandlePageCount(),
+    m_emsPhysMapHandle(),
+    m_emsPhysMapLogical(),
+    m_emsPhysMapPoolPage(),
+    m_emsSaved(),
+    m_emsSavedHandle(),
+    m_emsSavedLogical(),
     m_keyboard(),
     m_bios(),
     m_textRenderer(),
@@ -281,10 +315,9 @@ PcMachine::PcMachine()
     m_port61(0),
     m_floppyDigitalOutputRegister(0),
     m_cmosIndex(0),
-    m_pitCounter(0),
-    m_pitReadLow(true),
+    m_pit(),
+    m_pitChannel0NextIrqMicros(0),
     m_timerUpdateCountdown(0),
-    m_lastTimerIrqTick(0),
     m_herculesCrtcIndex(0),
     m_herculesCrtcRegisters(),
     m_herculesConfigRegister(0),
@@ -299,6 +332,7 @@ PcMachine::~PcMachine()
   freeMachineMemory(m_ram);
   freeMachineMemory(m_videoMemory);
   freeMachineMemory(m_vgaPlaneMemory);
+  freeMachineMemory(m_emsPool);
 }
 
 bool PcMachine::init()
@@ -311,6 +345,11 @@ bool PcMachine::init()
     m_vgaPlaneMemory = allocateMachineMemory(4 * 64 * 1024);
   if (!m_ram || !m_videoMemory || !m_vgaPlaneMemory)
     return false;
+
+  // EMS is optional: if the pool cannot be allocated the machine still runs,
+  // just without expanded memory (emsAvailable() stays false).
+  if (!m_emsPool)
+    m_emsPool = allocateMachineMemory(static_cast<size_t>(EmsTotalPages) * EmsLogicalPageSize);
 
   reset();
   return true;
@@ -339,10 +378,10 @@ void PcMachine::reset()
   m_port61 = 0;
   m_floppyDigitalOutputRegister = 0;
   m_cmosIndex = 0;
-  m_pitCounter = 0;
-  m_pitReadLow = true;
+  pitReset();
+  emsReset();
+  m_opl2.reset();
   m_timerUpdateCountdown = 0;
-  m_lastTimerIrqTick = 0;
   resetVideoState();
   loadDefaultTextFontPlane();
   updateTextRendererFontMap();
@@ -803,9 +842,18 @@ bool PcMachine::prepareBootCpu()
                         readVideoMemory8Callback,
                         readVideoMemory16Callback,
                         interruptCallback);
+  PcI8086::setUnsupportedOpcodeHandler(unsupportedOpcodeCallback);
+  // Route the 64 KiB EMS page frame at E000:0 to the pool so mapped pages never
+  // need copying and aliased physical frames share one backing (see emsMapPage).
+  PcI8086::setEmsWindow(static_cast<uint32_t>(EmsPageFrameSegment) << 4,
+                        (static_cast<uint32_t>(EmsPageFrameSegment) << 4) +
+                            static_cast<uint32_t>(EmsPhysicalPages) * EmsLogicalPageSize,
+                        emsReadCallback,
+                        emsWriteCallback);
   PcI8086::setMemory(m_ram);
   PcI8086::reset();
   initializeBiosDataArea();
+  updateEmsWindowActive();
   PcI8086::setCS(m_bootState.segment);
   PcI8086::setIP(m_bootState.offset);
   PcI8086::setDS(0x0000);
@@ -816,17 +864,189 @@ bool PcMachine::prepareBootCpu()
   return true;
 }
 
+void PcMachine::pitReset()
+{
+  uint64_t const now = monotonicMicroseconds();
+  for (int i = 0; i < 3; ++i) {
+    m_pit[i] = PitChannel{};
+    m_pit[i].accessMode = 3;
+    m_pit[i].operatingMode = 3;
+    m_pit[i].gate = (i != 2); // channels 0/1 are always enabled; channel 2 gated by port 61h
+    m_pit[i].phaseBaseMicros = now;
+  }
+  m_pitChannel0NextIrqMicros = 0;
+}
+
+uint32_t PcMachine::pitDivisor(int channel) const
+{
+  if (channel < 0 || channel > 2)
+    return 65536;
+  return m_pit[channel].reloadValue ? m_pit[channel].reloadValue : 65536;
+}
+
+uint16_t PcMachine::pitCurrentCount(int channel) const
+{
+  if (channel < 0 || channel > 2)
+    return 0;
+  uint32_t const divisor = pitDivisor(channel);
+  uint64_t const elapsedMicros = monotonicMicroseconds() - m_pit[channel].phaseBaseMicros;
+  uint64_t elapsedTicks = (elapsedMicros * PitInputHz) / 1000000ull;
+  // Mode 3 (square wave, the BIOS default for channel 0) decrements the counter
+  // by two per input clock so it sweeps the full range twice per output period.
+  if (m_pit[channel].operatingMode == 3)
+    elapsedTicks *= 2;
+  uint32_t const counted = static_cast<uint32_t>(elapsedTicks % divisor);
+  uint32_t const current = divisor - counted; // ranges 1..divisor
+  return static_cast<uint16_t>(current & 0xffff);
+}
+
+void PcMachine::pitLatch(int channel)
+{
+  if (channel < 0 || channel > 2)
+    return;
+  m_pit[channel].latchValue = pitCurrentCount(channel);
+  m_pit[channel].latched = true;
+  m_pit[channel].readHigh = false;
+}
+
+void PcMachine::onPitReload(int channel)
+{
+  m_pit[channel].phaseBaseMicros = monotonicMicroseconds();
+  if (channel == 0) {
+    uint64_t const period = (static_cast<uint64_t>(pitDivisor(0)) * 1000000ull) / PitInputHz;
+    m_pitChannel0NextIrqMicros = m_pit[0].phaseBaseMicros + (period ? period : 1);
+  }
+}
+
+void PcMachine::pitWriteCommand(uint8_t value)
+{
+  uint8_t const channel = static_cast<uint8_t>(value >> 6);
+  uint8_t const access = static_cast<uint8_t>((value >> 4) & 0x03);
+  if (channel == 3)
+    return; // 8254 read-back command: not modelled
+  if (access == 0) {
+    pitLatch(channel); // counter-latch command
+    return;
+  }
+  PitChannel & c = m_pit[channel];
+  c.accessMode = access;
+  uint8_t mode = static_cast<uint8_t>((value >> 1) & 0x07);
+  if (mode == 6)
+    mode = 2;
+  else if (mode == 7)
+    mode = 3;
+  c.operatingMode = mode;
+  c.bcd = (value & 0x01) != 0;
+  c.writeHigh = false;
+  c.readHigh = false;
+  c.latched = false;
+}
+
+void PcMachine::pitWriteData(int channel, uint8_t value)
+{
+  if (channel < 0 || channel > 2)
+    return;
+  PitChannel & c = m_pit[channel];
+  bool reloadComplete = false;
+  switch (c.accessMode) {
+    case 1: // lobyte only
+      c.reloadValue = static_cast<uint16_t>((c.reloadValue & 0xff00) | value);
+      reloadComplete = true;
+      break;
+    case 2: // hibyte only
+      c.reloadValue = static_cast<uint16_t>((c.reloadValue & 0x00ff) | (value << 8));
+      reloadComplete = true;
+      break;
+    default: // lobyte then hibyte
+      if (!c.writeHigh) {
+        c.reloadValue = static_cast<uint16_t>((c.reloadValue & 0xff00) | value);
+        c.writeHigh = true;
+      } else {
+        c.reloadValue = static_cast<uint16_t>((c.reloadValue & 0x00ff) | (value << 8));
+        c.writeHigh = false;
+        reloadComplete = true;
+      }
+      break;
+  }
+  if (reloadComplete)
+    onPitReload(channel);
+}
+
+uint8_t PcMachine::pitReadData(int channel)
+{
+  if (channel < 0 || channel > 2)
+    return 0;
+  PitChannel & c = m_pit[channel];
+  uint16_t const count = c.latched ? c.latchValue : pitCurrentCount(channel);
+  uint8_t result = 0;
+  switch (c.accessMode) {
+    case 1:
+      result = static_cast<uint8_t>(count & 0xff);
+      c.latched = false;
+      break;
+    case 2:
+      result = static_cast<uint8_t>(count >> 8);
+      c.latched = false;
+      break;
+    default:
+      if (!c.readHigh) {
+        result = static_cast<uint8_t>(count & 0xff);
+        c.readHigh = true;
+      } else {
+        result = static_cast<uint8_t>(count >> 8);
+        c.readHigh = false;
+        c.latched = false;
+      }
+      break;
+  }
+  return result;
+}
+
+void PcMachine::serviceTimerInterrupt()
+{
+  uint64_t const now = monotonicMicroseconds();
+  uint64_t period = (static_cast<uint64_t>(pitDivisor(0)) * 1000000ull) / PitInputHz;
+  if (period == 0)
+    period = 1;
+  if (m_pitChannel0NextIrqMicros == 0)
+    m_pitChannel0NextIrqMicros = now + period;
+  if (now < m_pitChannel0NextIrqMicros)
+    return;
+
+  // Advance one period; if we fell far behind (guest paused, slow slice) resync
+  // to now so a backlog of ticks cannot storm the guest with interrupts.
+  if (now - m_pitChannel0NextIrqMicros > period * 4)
+    m_pitChannel0NextIrqMicros = now + period;
+  else
+    m_pitChannel0NextIrqMicros += period;
+
+  // The BIOS 0040:006C tick is derived from wall-clock time, so it stays correct
+  // even when a game reprograms channel 0 to a higher IRQ0 frequency.
+  m_bios.updateTimerBda(*this);
+  if ((m_picMask & 0x01) == 0)
+    PcI8086::IRQ(0x08);
+}
+
+bool PcMachine::speakerEnabled() const
+{
+  // Speaker sounds when both the timer-2 gate (bit 0) and the speaker data
+  // enable (bit 1) of port 61h are set.
+  return (m_port61 & 0x03) == 0x03;
+}
+
+uint32_t PcMachine::speakerFrequency() const
+{
+  uint32_t const divisor = pitDivisor(2);
+  if (!speakerEnabled() || divisor == 0)
+    return 0;
+  return PitInputHz / divisor;
+}
+
 void PcMachine::stepCpu()
 {
   if (--m_timerUpdateCountdown <= 0) {
-    uint32_t const timerTick = m_bios.timerDayTicks();
-    if (timerTick != m_lastTimerIrqTick) {
-      m_bios.updateTimerBda(*this);
-      m_lastTimerIrqTick = timerTick;
-      if ((m_picMask & 0x01) == 0)
-        PcI8086::IRQ(0x08);
-    }
-    m_timerUpdateCountdown = 2048;
+    serviceTimerInterrupt();
+    m_timerUpdateCountdown = 1024;
   }
   m_bios.dispatchMouseCallback(*this);
   if (m_keyboard.irqPending() && !m_keyboardIrqInService) {
@@ -988,15 +1208,15 @@ uint8_t PcMachine::readPort(uint16_t port)
     case 0x0023: // chipset/configuration data used by DOS probes
       return 0x00;
     case 0x0040: // PIT channel 0 counter
-    {
-      m_pitCounter = static_cast<uint16_t>(m_pitCounter - 0x0137);
-      uint8_t const value = m_pitReadLow ? static_cast<uint8_t>(m_pitCounter & 0xff)
-                                         : static_cast<uint8_t>(m_pitCounter >> 8);
-      m_pitReadLow = !m_pitReadLow;
-      return value;
-    }
+      return pitReadData(0);
+    case 0x0041: // PIT channel 1 counter
+      return pitReadData(1);
     case 0x0042: // PIT channel 2 counter
-      return 0x00;
+      return pitReadData(2);
+    case 0x0388: // AdLib/OPL2 status register
+      return m_opl2.readStatus(monotonicMicroseconds());
+    case 0x0389: // AdLib/OPL2 data port is write-only
+      return 0xff;
     case 0x0060:
     {
       uint8_t const value = m_keyboard.readDataPort();
@@ -1121,16 +1341,29 @@ void PcMachine::writePort(uint16_t port, uint8_t value)
     case 0x0023: // chipset/configuration data used by DOS probes
       break;
     case 0x0040: // PIT channel 0 reload data
+      pitWriteData(0, value);
+      break;
+    case 0x0041: // PIT channel 1 reload data
+      pitWriteData(1, value);
+      break;
     case 0x0042: // PIT channel 2 reload data
+      pitWriteData(2, value);
       break;
     case 0x0043: // PIT mode/command
-      m_pitReadLow = true;
+      pitWriteCommand(value);
+      break;
+    case 0x0388: // AdLib/OPL2 register-select port
+      m_opl2.writeAddress(value);
+      break;
+    case 0x0389: // AdLib/OPL2 register-data port
+      m_opl2.writeData(value, monotonicMicroseconds());
       break;
     case 0x0060:
       m_keyboard.writeDataPort(value);
       break;
     case 0x0061: // PPI/speaker control
       m_port61 = value;
+      m_pit[2].gate = (value & 0x01) != 0; // bit 0 gates PIT channel 2
       break;
     case 0x0064:
       m_keyboard.writeCommandPort(value);
@@ -1579,6 +1812,60 @@ void PcMachine::vgaWritePlaneByte(uint32_t offset, uint8_t value, uint8_t planeM
   }
 }
 
+PcMachine::MouseCursorOverlay PcMachine::computeMouseOverlay(int sourceWidth,
+                                                             int sourceHeight,
+                                                             bool textMode,
+                                                             int cellWidth,
+                                                             int cellHeight) const
+{
+  MouseCursorOverlay overlay;
+  PcBios::MouseRenderInfo const info = m_bios.mouseRenderInfo();
+  if (!info.visible || sourceWidth <= 0 || sourceHeight <= 0)
+    return overlay;
+
+  // Honor a conditional-off (exclusion) region set via INT 33h AX=0010.
+  if (info.excludeActive && info.x >= info.excludeLeft && info.x <= info.excludeRight &&
+      info.y >= info.excludeTop && info.y <= info.excludeBottom)
+    return overlay;
+
+  // Map the DOS virtual mouse coordinate onto the source frame. This inverts the
+  // forward mapping performed by setMouseSourceState so the pointer tracks touch.
+  int const xSpan = info.maxX > info.minX ? (info.maxX - info.minX) : 0;
+  int const ySpan = info.maxY > info.minY ? (info.maxY - info.minY) : 0;
+  int sourceX = xSpan > 0
+                  ? static_cast<int>(static_cast<long>(info.x - info.minX) * (sourceWidth - 1) / xSpan)
+                  : 0;
+  int sourceY = ySpan > 0
+                  ? static_cast<int>(static_cast<long>(info.y - info.minY) * (sourceHeight - 1) / ySpan)
+                  : 0;
+  if (sourceX < 0)
+    sourceX = 0;
+  if (sourceX > sourceWidth - 1)
+    sourceX = sourceWidth - 1;
+  if (sourceY < 0)
+    sourceY = 0;
+  if (sourceY > sourceHeight - 1)
+    sourceY = sourceHeight - 1;
+
+  overlay.visible = true;
+  if (textMode) {
+    int const cw = cellWidth > 0 ? cellWidth : 1;
+    int const ch = cellHeight > 0 ? cellHeight : 1;
+    overlay.textCell = true;
+    overlay.x = (sourceX / cw) * cw;
+    overlay.y = (sourceY / ch) * ch;
+    overlay.cellWidth = cw;
+    overlay.cellHeight = ch;
+  } else {
+    overlay.textCell = false;
+    overlay.x = sourceX - info.hotspotX;
+    overlay.y = sourceY - info.hotspotY;
+    memcpy(overlay.screenMask, info.screenMask, sizeof(overlay.screenMask));
+    memcpy(overlay.cursorMask, info.cursorMask, sizeof(overlay.cursorMask));
+  }
+  return overlay;
+}
+
 uint8_t const * PcMachine::text80Buffer() const
 {
   if (!m_videoMemory)
@@ -1678,6 +1965,13 @@ uint8_t PcMachine::vgaInputStatus0() const
 
 bool PcMachine::usesPlanarVgaMemory() const
 {
+  // A mode-13h program that clears the sequencer chain-4 bit (SEQ 04 bit 3) is
+  // running unchained 256-color "Mode X": the CPU aperture becomes planar and
+  // the sequencer Map Mask selects the target plane per write. This routes such
+  // access through the planar read/write engine (map mask, latches, write modes)
+  // and the planar 256-color renderer, which together give page flipping and
+  // latch-copy fills. No explicit INT 10h mode number exists for Mode X, so it
+  // is detected purely from the register state below.
   return m_videoMode == VideoMode::VgaGraphics320x200x16 ||
          m_videoMode == VideoMode::VgaGraphics640x200x16 ||
          m_videoMode == VideoMode::VgaGraphics640x350x2 ||
@@ -2613,6 +2907,16 @@ void PcMachine::recordUnsupportedInterrupt(int interruptNumber)
   m_diagnostics.lastUnsupportedInterruptAh = PcI8086::AH();
 }
 
+void PcMachine::unsupportedOpcodeCallback(void * context, uint16_t cs, uint16_t ip, uint8_t op0, uint8_t op1)
+{
+  auto * machine = static_cast<PcMachine *>(context);
+  ++machine->m_diagnostics.unsupportedOpcodeCount;
+  machine->m_diagnostics.lastUnsupportedOpcodeCs = cs;
+  machine->m_diagnostics.lastUnsupportedOpcodeIp = ip;
+  machine->m_diagnostics.lastUnsupportedOpcode0 = op0;
+  machine->m_diagnostics.lastUnsupportedOpcode1 = op1;
+}
+
 void PcMachine::recordUnsupportedPortRead(uint16_t port)
 {
   ++m_diagnostics.unsupportedPortReadCount;
@@ -2866,6 +3170,332 @@ void PcMachine::initializeBiosDataArea()
   writeVideoParameterEntry(0x1a, 80, 29, 16, 0x0000);
   writeVideoParameterEntry(0x1b, 80, 29, 16, 0x0000);
   writeVideoParameterEntry(0x1c, 40, 24, 8, 0xfa00);
+
+  setupEmsDriver();
+}
+
+void PcMachine::emsReset()
+{
+  for (int i = 0; i < EmsTotalPages; ++i)
+    m_emsPageOwner[i] = 0;
+  for (int h = 0; h <= EmsMaxHandles; ++h) {
+    m_emsHandleActive[h] = false;
+    m_emsHandlePageCount[h] = 0;
+    m_emsSaved[h] = false;
+    for (int p = 0; p < EmsPhysicalPages; ++p) {
+      m_emsSavedHandle[h][p] = 0;
+      m_emsSavedLogical[h][p] = -1;
+    }
+  }
+  for (int p = 0; p < EmsPhysicalPages; ++p) {
+    m_emsPhysMapHandle[p] = 0;
+    m_emsPhysMapLogical[p] = -1;
+    m_emsPhysMapPoolPage[p] = -1;
+  }
+  updateEmsWindowActive();
+}
+
+void PcMachine::updateEmsWindowActive()
+{
+  // The CPU only pays the page-frame redirect cost while at least one physical
+  // page is mapped; otherwise E000:0 falls through to flat RAM.
+  bool active = false;
+  for (int p = 0; p < EmsPhysicalPages; ++p) {
+    if (m_emsPhysMapPoolPage[p] >= 0) {
+      active = true;
+      break;
+    }
+  }
+  PcI8086::setEmsWindowActive(active);
+}
+
+uint8_t PcMachine::emsReadCallback(void * context, int address)
+{
+  auto * machine = static_cast<PcMachine *>(context);
+  uint32_t const offset = static_cast<uint32_t>(address) - (static_cast<uint32_t>(EmsPageFrameSegment) << 4);
+  int const slot = static_cast<int>(offset / EmsLogicalPageSize);
+  if (slot < 0 || slot >= EmsPhysicalPages)
+    return 0xff;
+  int const poolPage = machine->m_emsPhysMapPoolPage[slot];
+  if (poolPage < 0 || !machine->m_emsPool)
+    return 0xff; // unmapped physical frame reads as floating high
+  uint32_t const inPage = offset % EmsLogicalPageSize;
+  return machine->m_emsPool[static_cast<size_t>(poolPage) * EmsLogicalPageSize + inPage];
+}
+
+void PcMachine::emsWriteCallback(void * context, int address, uint8_t value)
+{
+  auto * machine = static_cast<PcMachine *>(context);
+  uint32_t const offset = static_cast<uint32_t>(address) - (static_cast<uint32_t>(EmsPageFrameSegment) << 4);
+  int const slot = static_cast<int>(offset / EmsLogicalPageSize);
+  if (slot < 0 || slot >= EmsPhysicalPages)
+    return;
+  int const poolPage = machine->m_emsPhysMapPoolPage[slot];
+  if (poolPage < 0 || !machine->m_emsPool)
+    return; // writes to an unmapped physical frame are discarded
+  uint32_t const inPage = offset % EmsLogicalPageSize;
+  machine->m_emsPool[static_cast<size_t>(poolPage) * EmsLogicalPageSize + inPage] = value;
+}
+
+void PcMachine::setupEmsDriver()
+{
+  if (!m_emsPool)
+    return; // no expanded memory: leave INT 67h unhooked
+
+  // Place a minimal EMM device driver header at F800:0000 so that guest EMS
+  // detection (which reads the 8-byte name at [INT 67h vector segment]:000A)
+  // recognizes "EMMXXXX0". INT 67h itself is serviced by the emulator.
+  //
+  // LIMITATION: this only supports the interrupt-vector-name detection method.
+  // The LIM-recommended method for transient programs -- DOS-opening the
+  // "EMMXXXX0" character device (INT 21h AH=3D) and issuing IOCTL -- goes
+  // through the DOS kernel booted from the disk image, which this BIOS layer
+  // cannot intercept, so that open returns file-not-found. Fully supporting it
+  // would require a resident EMM stub loaded via the guest's CONFIG.SYS that
+  // links into the DOS device chain. Programs using only the vector-name check
+  // (and any that call INT 67h directly) work as-is.
+  static constexpr uint16_t EmmSegment = 0xf800;
+  uint32_t const base = static_cast<uint32_t>(EmmSegment) << 4;
+  writeMemory16(base + 0x00, 0xffff); // next device offset
+  writeMemory16(base + 0x02, 0xffff); // next device segment (none)
+  writeMemory16(base + 0x04, 0x8000); // attributes: character device
+  writeMemory16(base + 0x06, 0x0016); // strategy entry offset (IRET stub)
+  writeMemory16(base + 0x08, 0x0016); // interrupt entry offset (IRET stub)
+  static constexpr char EmmName[8] = {'E', 'M', 'M', 'X', 'X', 'X', 'X', '0'};
+  for (int i = 0; i < 8; ++i)
+    writeMemory8(base + 0x0a + i, static_cast<uint8_t>(EmmName[i]));
+  writeMemory8(base + 0x16, 0xcf); // IRET stub
+
+  writeMemory16(0x67 * 4 + 0, 0x0016);   // INT 67h vector offset
+  writeMemory16(0x67 * 4 + 2, EmmSegment); // INT 67h vector segment
+}
+
+int PcMachine::emsFreePageCount() const
+{
+  int free = 0;
+  for (int i = 0; i < EmsTotalPages; ++i)
+    if (m_emsPageOwner[i] == 0)
+      ++free;
+  return free;
+}
+
+int PcMachine::emsActiveHandleCount() const
+{
+  int count = 0;
+  for (int h = 1; h <= EmsMaxHandles; ++h)
+    if (m_emsHandleActive[h])
+      ++count;
+  return count;
+}
+
+int PcMachine::emsAllocateHandle(int pages)
+{
+  if (pages > emsFreePageCount())
+    return -2; // not enough free pages
+  int handle = -1;
+  for (int h = 1; h <= EmsMaxHandles; ++h) {
+    if (!m_emsHandleActive[h]) {
+      handle = h;
+      break;
+    }
+  }
+  if (handle < 0)
+    return -1; // no free handles
+  int allocated = 0;
+  for (int i = 0; i < EmsTotalPages && allocated < pages; ++i) {
+    if (m_emsPageOwner[i] == 0) {
+      m_emsPageOwner[i] = handle;
+      ++allocated;
+    }
+  }
+  m_emsHandleActive[handle] = true;
+  m_emsHandlePageCount[handle] = pages;
+  return handle;
+}
+
+bool PcMachine::emsFreeHandle(int handle)
+{
+  if (handle <= 0 || handle > EmsMaxHandles || !m_emsHandleActive[handle])
+    return false;
+  for (int i = 0; i < EmsTotalPages; ++i)
+    if (m_emsPageOwner[i] == handle)
+      m_emsPageOwner[i] = 0;
+  for (int p = 0; p < EmsPhysicalPages; ++p) {
+    if (m_emsPhysMapHandle[p] == handle) {
+      m_emsPhysMapHandle[p] = 0;
+      m_emsPhysMapLogical[p] = -1;
+      m_emsPhysMapPoolPage[p] = -1;
+    }
+  }
+  m_emsHandleActive[handle] = false;
+  m_emsHandlePageCount[handle] = 0;
+  m_emsSaved[handle] = false;
+  updateEmsWindowActive();
+  return true;
+}
+
+int PcMachine::emsLogicalToPool(int handle, int logicalPage) const
+{
+  if (handle <= 0 || handle > EmsMaxHandles || !m_emsHandleActive[handle])
+    return -1;
+  if (logicalPage < 0 || logicalPage >= m_emsHandlePageCount[handle])
+    return -1;
+  int seen = 0;
+  for (int i = 0; i < EmsTotalPages; ++i) {
+    if (m_emsPageOwner[i] == handle) {
+      if (seen == logicalPage)
+        return i;
+      ++seen;
+    }
+  }
+  return -1;
+}
+
+void PcMachine::emsMapPage(int physPage, int handle, int logicalPage)
+{
+  if (!m_emsPool || physPage < 0 || physPage >= EmsPhysicalPages)
+    return;
+
+  // Pure pointer remap: record which pool page this physical frame resolves to
+  // and let the CPU page-frame redirect (emsRead/WriteCallback) hit the pool
+  // directly. No data is copied, so mapping the same logical page into two
+  // physical frames aliases one backing store, matching real EMS semantics.
+  if (logicalPage < 0) {
+    m_emsPhysMapHandle[physPage] = 0;
+    m_emsPhysMapLogical[physPage] = -1;
+    m_emsPhysMapPoolPage[physPage] = -1;
+  } else {
+    m_emsPhysMapHandle[physPage] = handle;
+    m_emsPhysMapLogical[physPage] = logicalPage;
+    m_emsPhysMapPoolPage[physPage] = emsLogicalToPool(handle, logicalPage);
+  }
+  updateEmsWindowActive();
+}
+
+bool PcMachine::handleEmsInterrupt()
+{
+  if (!m_emsPool)
+    return false;
+
+  uint8_t const function = PcI8086::AH();
+  switch (function) {
+    case 0x40: // get manager status
+      PcI8086::setAH(0x00);
+      return true;
+    case 0x41: // get page frame segment
+      PcI8086::setBX(EmsPageFrameSegment);
+      PcI8086::setAH(0x00);
+      return true;
+    case 0x42: // get number of pages
+      PcI8086::setBX(static_cast<uint16_t>(emsFreePageCount()));
+      PcI8086::setDX(static_cast<uint16_t>(EmsTotalPages));
+      PcI8086::setAH(0x00);
+      return true;
+    case 0x43: // allocate handle and pages
+    {
+      int const pages = PcI8086::BX();
+      int const handle = emsAllocateHandle(pages);
+      if (handle == -1) {
+        PcI8086::setAH(0x85); // all handles in use
+      } else if (handle == -2) {
+        PcI8086::setAH(0x88); // not enough free pages
+      } else {
+        PcI8086::setDX(static_cast<uint16_t>(handle));
+        PcI8086::setAH(0x00);
+      }
+      return true;
+    }
+    case 0x44: // map handle page
+    {
+      int const physPage = PcI8086::AL();
+      int const logicalPage = PcI8086::BX();
+      int const handle = PcI8086::DX();
+      if (physPage < 0 || physPage >= EmsPhysicalPages) {
+        PcI8086::setAH(0x8b); // illegal physical page
+      } else if (handle <= 0 || handle > EmsMaxHandles || !m_emsHandleActive[handle]) {
+        PcI8086::setAH(0x83); // invalid handle
+      } else if (logicalPage == 0xffff) {
+        emsMapPage(physPage, handle, -1); // unmap
+        PcI8086::setAH(0x00);
+      } else if (logicalPage >= m_emsHandlePageCount[handle]) {
+        PcI8086::setAH(0x8a); // logical page out of range
+      } else {
+        emsMapPage(physPage, handle, logicalPage);
+        PcI8086::setAH(0x00);
+      }
+      return true;
+    }
+    case 0x45: // release handle and pages
+      PcI8086::setAH(emsFreeHandle(PcI8086::DX()) ? 0x00 : 0x83);
+      return true;
+    case 0x46: // get EMM version
+      PcI8086::setAL(0x32); // version 3.2
+      PcI8086::setAH(0x00);
+      return true;
+    case 0x47: // save page map
+    {
+      int const handle = PcI8086::DX();
+      if (handle <= 0 || handle > EmsMaxHandles || !m_emsHandleActive[handle]) {
+        PcI8086::setAH(0x83);
+      } else {
+        for (int p = 0; p < EmsPhysicalPages; ++p) {
+          m_emsSavedHandle[handle][p] = m_emsPhysMapHandle[p];
+          m_emsSavedLogical[handle][p] = m_emsPhysMapLogical[p];
+        }
+        m_emsSaved[handle] = true;
+        PcI8086::setAH(0x00);
+      }
+      return true;
+    }
+    case 0x48: // restore page map
+    {
+      int const handle = PcI8086::DX();
+      if (handle <= 0 || handle > EmsMaxHandles || !m_emsHandleActive[handle]) {
+        PcI8086::setAH(0x83);
+      } else if (!m_emsSaved[handle]) {
+        PcI8086::setAH(0x8c); // no context saved
+      } else {
+        for (int p = 0; p < EmsPhysicalPages; ++p)
+          emsMapPage(p, m_emsSavedHandle[handle][p], m_emsSavedLogical[handle][p]);
+        PcI8086::setAH(0x00);
+      }
+      return true;
+    }
+    case 0x4b: // get number of open handles
+      PcI8086::setBX(static_cast<uint16_t>(emsActiveHandleCount()));
+      PcI8086::setAH(0x00);
+      return true;
+    case 0x4c: // get pages owned by handle
+    {
+      int const handle = PcI8086::DX();
+      if (handle <= 0 || handle > EmsMaxHandles || !m_emsHandleActive[handle]) {
+        PcI8086::setAH(0x83);
+      } else {
+        PcI8086::setBX(static_cast<uint16_t>(m_emsHandlePageCount[handle]));
+        PcI8086::setAH(0x00);
+      }
+      return true;
+    }
+    case 0x4d: // get pages for all handles
+    {
+      uint32_t dest = (static_cast<uint32_t>(PcI8086::ES()) << 4) + PcI8086::DI();
+      int count = 0;
+      for (int h = 1; h <= EmsMaxHandles; ++h) {
+        if (m_emsHandleActive[h]) {
+          writeMemory16(dest, static_cast<uint16_t>(h));
+          writeMemory16(dest + 2, static_cast<uint16_t>(m_emsHandlePageCount[h]));
+          dest += 4;
+          ++count;
+        }
+      }
+      PcI8086::setBX(static_cast<uint16_t>(count));
+      PcI8086::setAH(0x00);
+      return true;
+    }
+    default:
+      PcI8086::setAH(0x84); // unsupported function
+      return true;
+  }
 }
 
 } // namespace tabdos

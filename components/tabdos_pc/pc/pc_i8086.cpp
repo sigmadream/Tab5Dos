@@ -153,6 +153,19 @@ uint8_t *                 PcI8086::s_memory;
 bool                      PcI8086::s_pendingIRQ;
 uint8_t                   PcI8086::s_pendingIRQIndex;
 bool                      PcI8086::s_halted;
+// Default to reporting a plain 8086 (FLAGS bits 12-15 read as 1 on PUSHF). This
+// core implements the 80186 instruction set but NOT the 80286 two-byte 0Fh
+// opcodes; a guest that detects a >=286 CPU and then executes e.g. SMSW (0F 01)
+// would desynchronize the decoder. Reporting 8086 keeps such guests on their
+// safe fallback path. Enable setReportAbove8086(true) only for titles verified
+// to gate on a >=286 CPU without issuing 0Fh instructions.
+bool                      PcI8086::s_reportAbove8086 = false;
+PcI8086::UnsupportedOpcode PcI8086::s_unsupportedOpcode = nullptr;
+bool                      PcI8086::s_emsActive = false;
+uint32_t                  PcI8086::s_emsBase = 0;
+uint32_t                  PcI8086::s_emsEnd = 0;
+PcI8086::ReadPort         PcI8086::s_emsRead = nullptr;
+PcI8086::WritePort        PcI8086::s_emsWrite = nullptr;
 
 
 
@@ -681,6 +694,8 @@ uint8_t PcI8086::RMEM8(int addr)
 {
   if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END) {
     return s_readVideoMemory8(s_context, addr);
+  } else if (s_emsActive && static_cast<uint32_t>(addr) >= s_emsBase && static_cast<uint32_t>(addr) < s_emsEnd) {
+    return s_emsRead(s_context, addr);
   } else if (isRegsAddress(addr, 1)) {
     return rawMem8(s_memory, addr);
   } else {
@@ -693,6 +708,10 @@ uint16_t PcI8086::RMEM16(int addr)
 {
   if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END) {
     return s_readVideoMemory16(s_context, addr);
+  } else if (s_emsActive && static_cast<uint32_t>(addr) >= s_emsBase && static_cast<uint32_t>(addr) < s_emsEnd) {
+    // Split into bytes so a word straddling a 16 KiB page boundary resolves each
+    // half through its own current mapping.
+    return static_cast<uint16_t>(s_emsRead(s_context, addr) | (s_emsRead(s_context, addr + 1) << 8));
   } else if (isRegsAddress(addr, 2)) {
     return rawMem16(s_memory, addr);
   } else {
@@ -705,6 +724,8 @@ inline __attribute__((always_inline)) uint8_t PcI8086::WMEM8(int addr, uint8_t v
 {
   if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END) {
     s_writeVideoMemory8(s_context, addr, value);
+  } else if (s_emsActive && static_cast<uint32_t>(addr) >= s_emsBase && static_cast<uint32_t>(addr) < s_emsEnd) {
+    s_emsWrite(s_context, addr, value);
   } else if (isRegsAddress(addr, 1)) {
     rawMem8(s_memory, addr) = value;
   } else {
@@ -718,6 +739,9 @@ inline __attribute__((always_inline)) uint16_t PcI8086::WMEM16(int addr, uint16_
 {
   if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END) {
     s_writeVideoMemory16(s_context, addr, value);
+  } else if (s_emsActive && static_cast<uint32_t>(addr) >= s_emsBase && static_cast<uint32_t>(addr) < s_emsEnd) {
+    s_emsWrite(s_context, addr, static_cast<uint8_t>(value & 0xff));
+    s_emsWrite(s_context, addr + 1, static_cast<uint8_t>(value >> 8));
   } else if (isRegsAddress(addr, 2)) {
     rawMem16(s_memory, addr) = value;
   } else {
@@ -744,11 +768,10 @@ void set_AF_OF_arith(int32_t op_result)
 // Assemble and return emulated CPU FLAGS register
 uint16_t PcI8086::make_flags()
 {
-  #if I80186MODE
-  uint16_t r = 0x0002;    // to pass test186 tests, just unused bit nr. 1 is set to 1 (some programs checks this to know if this is a 80186 or 8086)
-  #else
-  uint16_t r = 0xf002;    // for real 8086
-  #endif
+  // Bits 12-15: an 8086 always reads them as 1 on PUSHF, whereas an 80186/80286
+  // in real mode reads them as 0. Guest CPU-detection code keys on exactly this,
+  // so the high nibble selects which part we impersonate.
+  uint16_t r = s_reportAbove8086 ? 0x0002 : 0xf002;
 
   return r | FLAG_CF << 0 | FLAG_PF << 2 | FLAG_AF << 4 | FLAG_ZF << 6 | FLAG_SF << 7 | FLAG_TF << 8 | FLAG_IF << 9 | FLAG_DF << 10 | FLAG_OF << 11;
 }
@@ -2142,7 +2165,10 @@ void PcI8086::stepEx(uint8_t const * opcode_stream)
       break;
       */
     default:
-      printf("Unsupported 8086 opcode %02X %02X\n", opcode_stream[0], opcode_stream[1]);
+      printf("Unsupported 8086 opcode %02X %02X at %04X:%04X\n",
+             opcode_stream[0], opcode_stream[1], regs16[REG_CS], reg_ip);
+      if (s_unsupportedOpcode)
+        s_unsupportedOpcode(s_context, regs16[REG_CS], reg_ip, opcode_stream[0], opcode_stream[1]);
       break;
   }
 

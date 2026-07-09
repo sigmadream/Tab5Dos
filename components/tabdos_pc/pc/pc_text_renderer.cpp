@@ -41,6 +41,37 @@ void PcTextRenderer::setFont(Font8x16 font)
   }
 }
 
+uint64_t PcTextRenderer::stateHash() const
+{
+  uint64_t h = 1469598103934665603ull;
+  auto fold = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  fold(reinterpret_cast<uintptr_t>(m_font.data));
+  fold(m_font.glyphCount);
+  fold(reinterpret_cast<uintptr_t>(m_vgaFontPlane));
+  fold(m_vgaCharacterMapClear);
+  fold(m_vgaCharacterMapSet);
+  fold(m_underlineLocation);
+  fold(m_vgaFontSelectionEnabled);
+  fold(static_cast<uint64_t>(m_columns));
+  fold(static_cast<uint64_t>(m_cellHeight));
+  fold(static_cast<uint64_t>(m_rows));
+  fold(static_cast<uint64_t>(m_cursorRow));
+  fold(static_cast<uint64_t>(m_cursorColumn));
+  fold(m_cursorStart);
+  fold(m_cursorEnd);
+  fold(m_cursorVisible);
+  fold(m_blinkEnabled);
+  fold(m_displayEnabled);
+  fold(m_lineGraphicsEnabled);
+  fold(m_nineDotTextMode);
+  fold(m_horizontalPanning);
+  fold(m_frameCounter);
+  for (int i = 0; i < 16; ++i)
+    fold(m_palette[i]);
+  fold(m_overscanColor);
+  return h;
+}
+
 uint8_t PcTextRenderer::characterMapIfAttributeClear(uint8_t characterMapSelect)
 {
   return static_cast<uint8_t>((characterMapSelect & 0x03) | ((characterMapSelect >> 2) & 0x04));
