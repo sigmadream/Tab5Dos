@@ -1,8 +1,10 @@
 #include "tab5_lcd_text.h"
 #include "tab5_runtime_log.h"
+#include "tab5_speaker.h"
 #include "tab5_usb_keyboard.h"
 
 #include "pc/pc_disk_catalog.h"
+#include "pc/pc_i8086.h"
 #include "pc/pc_machine.h"
 
 #include "bsp/esp-bsp.h"
@@ -12,23 +14,45 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_touch.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <algorithm>
+#include <atomic>
 #include <ctype.h>
 #include <string>
 #include <string.h>
 #include <sys/stat.h>
 
+#ifndef TABDOS_CPU_PROFILE
+#define TABDOS_CPU_PROFILE 0
+#endif
+
 namespace {
 static char const * TAG = "tabdos_tab5";
-static constexpr int CpuStepsPerSlice = 25000;
-static constexpr int CpuSlicesBeforeDelay = 8;
+// Smaller slices release the machine mutex ~5x more often so USB keyboard/touch
+// injection waits at most one short slice (~6 ms at the current throughput)
+// instead of a full 31 ms slice. SlicesBeforeDelay is scaled up by the same
+// factor so the vTaskDelay cadence (and thus emulation throughput) is unchanged:
+// 5000 * 40 == 25000 * 8 == 200000 instructions between rests.
+static constexpr int CpuStepsPerSlice = 5000;
+static constexpr int CpuSlicesBeforeDelay = 40;
 static constexpr TickType_t CpuRestDelay = 1;
-static constexpr TickType_t DisplayDelay = pdMS_TO_TICKS(100);
+static constexpr TickType_t DisplayIdleDelay = pdMS_TO_TICKS(33);
+// While the screen is actively changing, back off only one tick so the refresh
+// rate is bounded by render time rather than a fixed 33 ms floor; when the frame
+// is unchanged, fall back to the idle cadence to free the core for other tasks.
+static constexpr TickType_t DisplayActiveDelay = pdMS_TO_TICKS(10);
+static constexpr TickType_t PerfLogInterval = pdMS_TO_TICKS(5000);
 static constexpr TickType_t DiskFlushInterval = pdMS_TO_TICKS(1000);
 static constexpr TickType_t TouchPollDelay = pdMS_TO_TICKS(20);
+// Hold a finger in the top-right corner of the panel for this long to trigger a
+// screenshot dump over serial. The corner box keeps it out of the way of normal
+// mouse/menu touches, and the long hold avoids accidental captures.
+static constexpr TickType_t ScreenshotHoldDelay = pdMS_TO_TICKS(1500);
+static constexpr int ScreenshotCornerPx = 120;
 static constexpr TickType_t SyntheticKeyHoldDelay = pdMS_TO_TICKS(90);
 static constexpr TickType_t SyntheticKeyGapDelay = pdMS_TO_TICKS(20);
 static constexpr int SyntheticKeyQueueCapacity = 32;
@@ -49,11 +73,125 @@ struct ScreenMilestones {
   bool writeFile;
 };
 
+#if TABDOS_CPU_PROFILE
+static constexpr uint32_t CpuProfileSampleMask = 63; // time one instruction out of 64
+static constexpr int CpuProfilePcSlots = 512;
+static constexpr int CpuProfileTopEntries = 8;
+
+struct OpcodeProfileEntry {
+  uint64_t executions;
+  uint64_t timedSamples;
+  uint64_t timedMicroseconds;
+  uint32_t maxMicroseconds;
+};
+
+struct PcProfileEntry {
+  uint32_t key;
+  uint64_t samples;
+  uint64_t timedMicroseconds;
+  uint32_t maxMicroseconds;
+  uint8_t opcode;
+  bool occupied;
+};
+
+static OpcodeProfileEntry s_opcodeProfile[256];
+static PcProfileEntry s_pcProfile[CpuProfilePcSlots];
+static uint32_t s_profileSequence;
+
+static void resetCpuProfile()
+{
+  memset(s_opcodeProfile, 0, sizeof(s_opcodeProfile));
+  memset(s_pcProfile, 0, sizeof(s_pcProfile));
+}
+
+static void recordPcProfile(uint16_t cs, uint16_t ip, uint8_t opcode, uint32_t elapsedUs)
+{
+  uint32_t const key = (static_cast<uint32_t>(cs) << 16) | ip;
+  uint32_t slot = (key * 2654435761u) & (CpuProfilePcSlots - 1);
+  for (int probe = 0; probe < CpuProfilePcSlots; ++probe) {
+    PcProfileEntry & entry = s_pcProfile[slot];
+    if (!entry.occupied || entry.key == key) {
+      if (!entry.occupied) {
+        entry.occupied = true;
+        entry.key = key;
+        entry.opcode = opcode;
+      }
+      ++entry.samples;
+      entry.timedMicroseconds += elapsedUs;
+      entry.maxMicroseconds = std::max(entry.maxMicroseconds, elapsedUs);
+      return;
+    }
+    slot = (slot + 1) & (CpuProfilePcSlots - 1);
+  }
+}
+
+static void logCpuProfile(uint64_t intervalSteps)
+{
+  uint64_t totalTimedMicroseconds = 0;
+  for (OpcodeProfileEntry const & entry : s_opcodeProfile)
+    totalTimedMicroseconds += entry.timedMicroseconds;
+
+  bool selectedOpcode[256] = {};
+  for (int rank = 0; rank < CpuProfileTopEntries; ++rank) {
+    int best = -1;
+    for (int opcode = 0; opcode < 256; ++opcode) {
+      if (!selectedOpcode[opcode] && s_opcodeProfile[opcode].timedSamples != 0 &&
+          (best < 0 || s_opcodeProfile[opcode].timedMicroseconds > s_opcodeProfile[best].timedMicroseconds ||
+           (s_opcodeProfile[opcode].timedMicroseconds == s_opcodeProfile[best].timedMicroseconds &&
+            s_opcodeProfile[opcode].executions > s_opcodeProfile[best].executions)))
+        best = opcode;
+    }
+    if (best < 0)
+      break;
+    selectedOpcode[best] = true;
+    OpcodeProfileEntry const & entry = s_opcodeProfile[best];
+    double const percent = intervalSteps ? 100.0 * static_cast<double>(entry.executions) / intervalSteps : 0.0;
+    double const averageUs = entry.timedSamples
+                                 ? static_cast<double>(entry.timedMicroseconds) / entry.timedSamples
+                                 : 0.0;
+    double const timePercent = totalTimedMicroseconds
+                                   ? 100.0 * static_cast<double>(entry.timedMicroseconds) /
+                                         static_cast<double>(totalTimedMicroseconds)
+                                   : 0.0;
+    ESP_LOGI(TAG,
+             "PROFILE OP rank=%d op=%02x exec=%llu %.1f%% samples=%llu time=%.1f%% avg=%.2fus max=%uus",
+             rank + 1, best, static_cast<unsigned long long>(entry.executions), percent,
+             static_cast<unsigned long long>(entry.timedSamples), timePercent, averageUs,
+             entry.maxMicroseconds);
+  }
+
+  bool selectedPc[CpuProfilePcSlots] = {};
+  for (int rank = 0; rank < CpuProfileTopEntries; ++rank) {
+    int best = -1;
+    for (int slot = 0; slot < CpuProfilePcSlots; ++slot) {
+      if (s_pcProfile[slot].occupied && !selectedPc[slot] &&
+          (best < 0 || s_pcProfile[slot].timedMicroseconds > s_pcProfile[best].timedMicroseconds ||
+           (s_pcProfile[slot].timedMicroseconds == s_pcProfile[best].timedMicroseconds &&
+            s_pcProfile[slot].samples > s_pcProfile[best].samples)))
+        best = slot;
+    }
+    if (best < 0)
+      break;
+    selectedPc[best] = true;
+    PcProfileEntry const & entry = s_pcProfile[best];
+    double const averageUs = entry.samples
+                                 ? static_cast<double>(entry.timedMicroseconds) / entry.samples
+                                 : 0.0;
+    ESP_LOGI(TAG,
+             "PROFILE PC rank=%d at=%04x:%04x op=%02x samples=%llu total=%lluus avg=%.2fus max=%uus",
+             rank + 1, static_cast<unsigned>(entry.key >> 16), static_cast<unsigned>(entry.key & 0xffff),
+             entry.opcode, static_cast<unsigned long long>(entry.samples),
+             static_cast<unsigned long long>(entry.timedMicroseconds), averageUs, entry.maxMicroseconds);
+  }
+}
+#endif
+
 struct AppState {
   tabdos::PcMachine machine;
   Tab5LcdText display;
   Tab5RuntimeLog runtimeLog;
   Tab5UsbKeyboard usbKeyboard;
+  Tab5Speaker speaker;
   SemaphoreHandle_t mutex = nullptr;
   esp_lcd_touch_handle_t touch = nullptr;
   uint8_t syntheticKeyModifiers[SyntheticKeyQueueCapacity] = {};
@@ -63,6 +201,14 @@ struct AppState {
   bool syntheticKeyActive = false;
   TickType_t syntheticKeyReleaseAt = 0;
   TickType_t syntheticKeyNextPressAt = 0;
+  // Screenshot ownership handshake: touch requests, display copies a stable
+  // source frame, and a low-priority task performs slow encoding/serial output.
+  std::atomic_bool screenshotRequested{false};
+  std::atomic_bool screenshotReady{false};
+  std::atomic_bool screenshotBusy{false};
+  uint16_t * screenshotFrame = nullptr;
+  int screenshotWidth = 0;
+  int screenshotHeight = 0;
 };
 
 struct BootDiskSelection {
@@ -519,6 +665,14 @@ static esp_err_t bootDefaultImage(AppState & app, std::string * imagePath)
   logHeapSnapshot("before PcMachine init");
   ESP_RETURN_ON_FALSE(app.machine.init(), ESP_ERR_NO_MEM, TAG, "PcMachine init failed");
   logHeapSnapshot("after PcMachine init");
+  if (app.machine.emsAvailable()) {
+    ESP_LOGI(TAG,
+             "EMS: LIM %u.%u, %u KiB, page frame %04x",
+             tabdos::PcMachine::EmsVersion >> 4,
+             tabdos::PcMachine::EmsVersion & 0x0f,
+             tabdos::PcMachine::EmsTotalPages * tabdos::PcMachine::EmsLogicalPageSize / 1024,
+             tabdos::PcMachine::EmsPageFrameSegment);
+  }
 
   std::string path;
   ESP_RETURN_ON_FALSE(tabdos::PcDiskCatalog::chooseDefaultImage(tabdos::PcDiskCatalog::DefaultDirectory, &path),
@@ -556,10 +710,35 @@ static void cpuTask(void * arg)
   uint64_t flushedDiskWriteCount = 0;
   TickType_t nextDiskFlush = xTaskGetTickCount() + DiskFlushInterval;
   int slicesSinceDelay = 0;
+  uint64_t stepsSincePerfLog = 0;
+  TickType_t nextPerfLog = xTaskGetTickCount() + PerfLogInterval;
+#if TABDOS_CPU_PROFILE
+  resetCpuProfile();
+#endif
   while (true) {
     xSemaphoreTake(app->mutex, portMAX_DELAY);
-    for (int i = 0; i < CpuStepsPerSlice; ++i)
+    for (int i = 0; i < CpuStepsPerSlice; ++i) {
+#if TABDOS_CPU_PROFILE
+      uint8_t const opcode = tabdos::PcI8086::currentOpcode();
+      ++s_opcodeProfile[opcode].executions;
+      if ((s_profileSequence++ & CpuProfileSampleMask) == 0) {
+        uint16_t const cs = tabdos::PcI8086::CS();
+        uint16_t const ip = tabdos::PcI8086::IP();
+        int64_t const startUs = esp_timer_get_time();
+        app->machine.stepCpu();
+        uint32_t const elapsedUs = static_cast<uint32_t>(esp_timer_get_time() - startUs);
+        OpcodeProfileEntry & entry = s_opcodeProfile[opcode];
+        ++entry.timedSamples;
+        entry.timedMicroseconds += elapsedUs;
+        entry.maxMicroseconds = std::max(entry.maxMicroseconds, elapsedUs);
+        recordPcProfile(cs, ip, opcode, elapsedUs);
+      } else {
+        app->machine.stepCpu();
+      }
+#else
       app->machine.stepCpu();
+#endif
+    }
     tabdos::PcMachine::Diagnostics diagnostics = app->machine.diagnostics();
     TickType_t const now = xTaskGetTickCount();
     if (diagnostics.diskWriteCount != flushedDiskWriteCount && now >= nextDiskFlush) {
@@ -575,6 +754,22 @@ static void cpuTask(void * arg)
     bool changed = diagnostics.unsupportedInterruptCount != lastDiagnostics.unsupportedInterruptCount ||
                    diagnostics.unsupportedPortReadCount != lastDiagnostics.unsupportedPortReadCount ||
                    diagnostics.unsupportedPortWriteCount != lastDiagnostics.unsupportedPortWriteCount;
+    if (diagnostics.unsupportedOpcodeCount != lastDiagnostics.unsupportedOpcodeCount) {
+      ESP_LOGW(TAG,
+               "OPCODE milestone: unsupported count=%llu op=%02x %02x at %04x:%04x",
+               static_cast<unsigned long long>(diagnostics.unsupportedOpcodeCount),
+               diagnostics.lastUnsupportedOpcode0,
+               diagnostics.lastUnsupportedOpcode1,
+               diagnostics.lastUnsupportedOpcodeCs,
+               diagnostics.lastUnsupportedOpcodeIp);
+      app->runtimeLog.line("OPCODE milestone: unsupported count=%llu op=%02x %02x at %04x:%04x",
+                           static_cast<unsigned long long>(diagnostics.unsupportedOpcodeCount),
+                           diagnostics.lastUnsupportedOpcode0,
+                           diagnostics.lastUnsupportedOpcode1,
+                           diagnostics.lastUnsupportedOpcodeCs,
+                           diagnostics.lastUnsupportedOpcodeIp);
+      lastDiagnostics = diagnostics;
+    }
     if (diagnostics.diskWriteCount != lastDiagnostics.diskWriteCount) {
       ESP_LOGI(TAG,
                "DISK milestone: write count=%llu drive=%02x lba=%llu sectors=%u",
@@ -591,15 +786,34 @@ static void cpuTask(void * arg)
     }
     if (changed && (diagnostics.unsupportedInterruptCount || diagnostics.unsupportedPortReadCount || diagnostics.unsupportedPortWriteCount)) {
       ESP_LOGW(TAG,
-               "diagnostic int=%llu portR=%llu portW=%llu lastInt=%02x ah=%02x read=%04x write=%04x",
+               "diagnostic int=%llu portR=%llu portW=%llu lastInt=%02x ah=%02x at %04x:%04x read=%04x write=%04x",
                static_cast<unsigned long long>(diagnostics.unsupportedInterruptCount),
                static_cast<unsigned long long>(diagnostics.unsupportedPortReadCount),
                static_cast<unsigned long long>(diagnostics.unsupportedPortWriteCount),
                diagnostics.lastUnsupportedInterrupt,
                diagnostics.lastUnsupportedInterruptAh,
+               diagnostics.lastUnsupportedInterruptCs,
+               diagnostics.lastUnsupportedInterruptIp,
                diagnostics.lastUnsupportedPortRead,
                diagnostics.lastUnsupportedPortWrite);
       lastDiagnostics = diagnostics;
+    }
+    stepsSincePerfLog += CpuStepsPerSlice;
+    if (now >= nextPerfLog) {
+      uint32_t const elapsedMs = static_cast<uint32_t>((now - (nextPerfLog - PerfLogInterval)) * portTICK_PERIOD_MS);
+      if (elapsedMs > 0) {
+        double const mips = static_cast<double>(stepsSincePerfLog) / (static_cast<double>(elapsedMs) * 1000.0);
+        ESP_LOGI(TAG, "CPU throughput: %.2f MIPS (%llu steps / %u ms)",
+                 mips, static_cast<unsigned long long>(stepsSincePerfLog), elapsedMs);
+      }
+#if TABDOS_CPU_PROFILE
+      logCpuProfile(stepsSincePerfLog);
+#endif
+      stepsSincePerfLog = 0;
+#if TABDOS_CPU_PROFILE
+      resetCpuProfile();
+#endif
+      nextPerfLog = now + PerfLogInterval;
     }
     ++slicesSinceDelay;
     if (slicesSinceDelay >= CpuSlicesBeforeDelay) {
@@ -608,6 +822,24 @@ static void cpuTask(void * arg)
     } else {
       taskYIELD();
     }
+  }
+}
+
+static void speakerTask(void * arg)
+{
+  auto * app = static_cast<AppState *>(arg);
+  static int16_t oplBuffer[Tab5Speaker::ChunkFrames];
+  static tabdos::Opl2::RegisterSnapshot oplSnapshot = {};
+  while (true) {
+    // Copy only the small register file and speaker state under the mutex; the
+    // expensive FM synthesis runs outside it so it never stalls the CPU task.
+    xSemaphoreTake(app->mutex, portMAX_DELAY);
+    uint32_t const frequency = app->machine.speakerFrequency();
+    app->machine.snapshotOpl2(&oplSnapshot);
+    xSemaphoreGive(app->mutex);
+    bool const oplActive = app->machine.synthesizeOpl2(oplSnapshot, oplBuffer, Tab5Speaker::ChunkFrames, Tab5Speaker::SampleRate);
+    // playChunk blocks for ~one chunk of audio, pacing this loop to real time.
+    app->speaker.playChunk(frequency, oplActive ? oplBuffer : nullptr);
   }
 }
 
@@ -626,10 +858,11 @@ static void displayTask(void * arg)
     return;
   }
   int constexpr MaxGraphicsPixels = tabdos::PcMachine::VgaGraphics16Width * tabdos::PcMachine::VgaGraphics16Height;
-  auto * graphicsFrame = static_cast<uint16_t *>(heap_caps_malloc(MaxGraphicsPixels * sizeof(uint16_t),
-                                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  // Cache-line aligned so the display's PPA hardware rotate can read it directly.
+  auto * graphicsFrame = static_cast<uint16_t *>(heap_caps_aligned_alloc(128, MaxGraphicsPixels * sizeof(uint16_t),
+                                                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!graphicsFrame)
-    graphicsFrame = static_cast<uint16_t *>(heap_caps_malloc(MaxGraphicsPixels * sizeof(uint16_t), MALLOC_CAP_8BIT));
+    graphicsFrame = static_cast<uint16_t *>(heap_caps_aligned_alloc(128, MaxGraphicsPixels * sizeof(uint16_t), MALLOC_CAP_8BIT));
   if (!graphicsFrame) {
     ESP_LOGE(TAG, "display graphics framebuffer allocation failed");
     app->runtimeLog.line("display graphics framebuffer allocation failed");
@@ -638,9 +871,13 @@ static void displayTask(void * arg)
     return;
   }
 
+  uint32_t lastDrawnFrames = 0;
+  uint32_t blitUsAccum = 0;
+  TickType_t nextFpsLog = xTaskGetTickCount() + PerfLogInterval;
   while (true) {
     tabdos::PcTextRenderer rendererSnapshot;
     tabdos::PcMachine::VideoMode videoMode = tabdos::PcMachine::VideoMode::Text80;
+    tabdos::MouseCursorOverlay cursorOverlay;
     int graphicsWidth = 0;
     int graphicsHeight = 0;
     xSemaphoreTake(app->mutex, portMAX_DELAY);
@@ -650,18 +887,80 @@ static void displayTask(void * arg)
     if (app->machine.isGraphicsMode()) {
       graphicsWidth = app->machine.graphicsWidth();
       graphicsHeight = app->machine.graphicsHeight();
-      if (graphicsWidth * graphicsHeight <= MaxGraphicsPixels)
+      if (graphicsWidth * graphicsHeight <= MaxGraphicsPixels) {
         app->machine.renderGraphicsFrameForDisplay(graphicsFrame, graphicsWidth);
+        cursorOverlay = app->machine.computeMouseOverlay(graphicsWidth, graphicsHeight, false, 0, 0);
+      }
+    } else {
+      cursorOverlay = app->machine.computeMouseOverlay(tabdos::PcTextRenderer::Width9,
+                                                       tabdos::PcTextRenderer::Height,
+                                                       true,
+                                                       tabdos::PcTextRenderer::CellWidth9,
+                                                       tabdos::PcTextRenderer::CellHeight);
     }
     xSemaphoreGive(app->mutex);
 
     uint8_t const * text80 = videoSnapshot + (tabdos::PcMachine::TextColorMemoryBase - tabdos::PcMachine::VideoMemoryBase);
     reportScreenMilestones(text80, rendererSnapshot.columns(), &milestones);
-    if (videoMode != tabdos::PcMachine::VideoMode::Text80 && graphicsWidth > 0 && graphicsHeight > 0)
+    uint32_t const drawnBefore = app->display.drawnFrameCount();
+    int64_t const blitStart = esp_timer_get_time();
+    if (videoMode != tabdos::PcMachine::VideoMode::Text80 && graphicsWidth > 0 && graphicsHeight > 0) {
+      Tab5LcdText::applyMouseCursor(graphicsFrame, graphicsWidth, graphicsHeight, cursorOverlay);
       app->display.blitRgb565(graphicsFrame, graphicsWidth, graphicsHeight);
-    else
-      app->display.blitText80(rendererSnapshot, text80);
-    vTaskDelay(DisplayDelay);
+    } else {
+      app->display.blitText80(rendererSnapshot, text80, cursorOverlay);
+    }
+    bool const drew = app->display.drawnFrameCount() != drawnBefore;
+    if (drew)
+      blitUsAccum += static_cast<uint32_t>(esp_timer_get_time() - blitStart);
+
+    // Copy a stable frame in the owner task, then let the low-priority
+    // screenshot task encode and serialize it without stalling presentation.
+    if (app->screenshotRequested.exchange(false, std::memory_order_acq_rel)) {
+      esp_err_t const shotErr = app->display.copySourceFrame(app->screenshotFrame,
+                                                             Tab5LcdText::ScreenshotMaxPixels,
+                                                             &app->screenshotWidth,
+                                                             &app->screenshotHeight);
+      if (shotErr == ESP_OK) {
+        app->screenshotReady.store(true, std::memory_order_release);
+      } else {
+        ESP_LOGW(TAG, "screenshot dump skipped: %s", esp_err_to_name(shotErr));
+        app->screenshotBusy.store(false, std::memory_order_release);
+      }
+    }
+
+    TickType_t const nowTick = xTaskGetTickCount();
+    if (nowTick >= nextFpsLog) {
+      uint32_t const drawn = app->display.drawnFrameCount();
+      uint32_t const drawnDelta = drawn - lastDrawnFrames;
+      uint32_t const elapsedMs = static_cast<uint32_t>((nowTick - (nextFpsLog - PerfLogInterval)) * portTICK_PERIOD_MS);
+      if (elapsedMs > 0)
+        ESP_LOGI(TAG, "display: %.1f fps drawn (%u frames / %u ms), avg blit %u us",
+                 static_cast<double>(drawnDelta) * 1000.0 / elapsedMs, drawnDelta, elapsedMs,
+                 drawnDelta ? blitUsAccum / drawnDelta : 0);
+      lastDrawnFrames = drawn;
+      blitUsAccum = 0;
+      nextFpsLog = nowTick + PerfLogInterval;
+    }
+    // Keep up with a changing screen; back off when it is static.
+    vTaskDelay(drew ? DisplayActiveDelay : DisplayIdleDelay);
+  }
+}
+
+static void screenshotTask(void * arg)
+{
+  auto * app = static_cast<AppState *>(arg);
+  while (true) {
+    if (!app->screenshotReady.exchange(false, std::memory_order_acq_rel)) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    esp_err_t const err = Tab5LcdText::dumpRgb565Base64(app->screenshotFrame,
+                                                        app->screenshotWidth,
+                                                        app->screenshotHeight);
+    if (err != ESP_OK)
+      ESP_LOGW(TAG, "screenshot dump failed: %s", esp_err_to_name(err));
+    app->screenshotBusy.store(false, std::memory_order_release);
   }
 }
 
@@ -675,6 +974,9 @@ static void touchMouseTask(void * arg)
   int lastSourceHeight = tabdos::PcTextRenderer::Height;
   bool wasPressed = false;
   bool suppressMouseButtonUntilRelease = false;
+  bool screenshotArmed = false;
+  bool screenshotFired = false;
+  TickType_t screenshotPressStart = 0;
 
   while (true) {
     esp_err_t err = esp_lcd_touch_read_data(app->touch);
@@ -682,6 +984,34 @@ static void touchMouseTask(void * arg)
     uint8_t pointCount = 0;
     if (err == ESP_OK)
       err = esp_lcd_touch_get_data(app->touch, &point, &pointCount, 1);
+
+    // Corner long-press => screenshot. Detected on raw LCD coordinates before the
+    // mutex; while the gesture is active the touch is withheld from the emulated
+    // mouse so it does not click anything under the finger.
+    bool const rawPressed = err == ESP_OK && pointCount > 0;
+    bool const inScreenshotCorner = rawPressed && point.x >= LcdWidth - ScreenshotCornerPx &&
+                                    point.y <= ScreenshotCornerPx;
+    TickType_t const nowTick = xTaskGetTickCount();
+    if (inScreenshotCorner) {
+      if (!screenshotArmed) {
+        screenshotArmed = true;
+        screenshotFired = false;
+        screenshotPressStart = nowTick;
+      } else if (!screenshotFired && (nowTick - screenshotPressStart) >= ScreenshotHoldDelay) {
+        bool expected = false;
+        if (app->screenshotFrame &&
+            app->screenshotBusy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+          app->screenshotRequested.store(true, std::memory_order_release);
+          ESP_LOGI(TAG, "screenshot requested via corner long-press");
+        } else {
+          ESP_LOGW(TAG, "screenshot request skipped: capture unavailable or busy");
+        }
+        screenshotFired = true;
+      }
+    } else {
+      screenshotArmed = false;
+      screenshotFired = false;
+    }
 
     xSemaphoreTake(app->mutex, portMAX_DELAY);
     serviceSyntheticKeyboard(*app, xTaskGetTickCount());
@@ -696,7 +1026,8 @@ static void touchMouseTask(void * arg)
 
     uint16_t sourceX = lastSourceX;
     uint16_t sourceY = lastSourceY;
-    bool const pressed = err == ESP_OK && pointCount > 0;
+    // A screenshot gesture is not forwarded to the emulated mouse.
+    bool const pressed = rawPressed && !inScreenshotCorner;
     if (pressed && lcdToSourcePoint(point.x, point.y, sourceWidth, sourceHeight, &sourceX, &sourceY)) {
       lastSourceX = sourceX;
       lastSourceY = sourceY;
@@ -902,10 +1233,36 @@ extern "C" void app_main(void)
     s_app.runtimeLog.line("touch init failed: %s; DOS mouse remains unavailable", esp_err_to_name(err));
   }
 
+  if (s_app.speaker.init() == ESP_OK) {
+    ESP_LOGI(TAG, "PC speaker audio enabled");
+    s_app.runtimeLog.line("PC speaker audio enabled");
+  } else {
+    s_app.runtimeLog.line("PC speaker audio unavailable");
+  }
+
+  s_app.screenshotFrame = static_cast<uint16_t *>(heap_caps_malloc(
+      Tab5LcdText::ScreenshotMaxPixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!s_app.screenshotFrame)
+    s_app.screenshotFrame = static_cast<uint16_t *>(heap_caps_malloc(
+        Tab5LcdText::ScreenshotMaxPixels * sizeof(uint16_t), MALLOC_CAP_8BIT));
+  if (!s_app.screenshotFrame) {
+    ESP_LOGW(TAG, "screenshot snapshot allocation failed; capture disabled");
+    s_app.runtimeLog.line("screenshot snapshot allocation failed; capture disabled");
+  }
+
   xTaskCreatePinnedToCore(cpuTask, "pc_cpu", 8192, &s_app, 6, nullptr, 1);
   xTaskCreatePinnedToCore(displayTask, "pc_lcd", 4096, &s_app, 4, nullptr, 0);
+  if (s_app.screenshotFrame &&
+      xTaskCreatePinnedToCore(screenshotTask, "pc_screenshot", 4096, &s_app, 2, nullptr, 0) != pdPASS) {
+    heap_caps_free(s_app.screenshotFrame);
+    s_app.screenshotFrame = nullptr;
+    ESP_LOGW(TAG, "screenshot task creation failed; capture disabled");
+    s_app.runtimeLog.line("screenshot task creation failed; capture disabled");
+  }
   if (s_app.touch)
     xTaskCreatePinnedToCore(touchMouseTask, "pc_touch_mouse", 4096, &s_app, 3, nullptr, 0);
+  if (s_app.speaker.ready())
+    xTaskCreatePinnedToCore(speakerTask, "pc_speaker", 4096, &s_app, 3, nullptr, 0);
 #if TABDOS_AUTOTEST_KEYS
   xTaskCreatePinnedToCore(autotestTask, "pc_autotest", 4096, &s_app, 3, nullptr, 0);
 #endif

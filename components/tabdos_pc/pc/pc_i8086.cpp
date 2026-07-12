@@ -110,33 +110,28 @@ namespace tabdos {
 
 
 // Global variable definitions
-static uint8_t    regs[48];
+alignas(uint16_t) static uint8_t regs[48];
 static uint8_t    flags[10];
 static int32_t    regs_offset;
 static uint8_t    * regs8, i_mod_size, i_d, i_w, raw_opcode_id, xlat_opcode_id, extra, rep_mode, seg_override_en, rep_override_en;
 static uint16_t   * regs16, reg_ip, seg_override;
 static uint32_t   op_source, op_dest, set_flags_type;
 static int32_t    op_to_addr, op_from_addr;
+static bool       trapInhibit;
 
 static constexpr int32_t REGS_OFFSET_SENTINEL = 0x110000;
+// The emulated 8086 exposes a 20-bit physical address bus. Segment:offset
+// calculations above 1 MiB therefore alias the low-memory aperture.
+static constexpr int PhysicalAddressMask = 0x0fffff;
 
 static bool isRegsAddress(int addr, int size)
 {
   return addr >= regs_offset && addr + size <= regs_offset + static_cast<int>(sizeof(regs));
 }
 
-static uint8_t & rawMem8(uint8_t * memory, int addr)
+static uint16_t readUnalignedWord(uint8_t const * bytes)
 {
-  if (isRegsAddress(addr, 1))
-    return regs[addr - regs_offset];
-  return memory[addr];
-}
-
-static uint16_t & rawMem16(uint8_t * memory, int addr)
-{
-  if (isRegsAddress(addr, 2))
-    return *reinterpret_cast<uint16_t *>(regs + addr - regs_offset);
-  return *reinterpret_cast<uint16_t *>(memory + addr);
+  return static_cast<uint16_t>(bytes[0] | (static_cast<uint16_t>(bytes[1]) << 8));
 }
 
 
@@ -153,6 +148,40 @@ uint8_t *                 PcI8086::s_memory;
 bool                      PcI8086::s_pendingIRQ;
 uint8_t                   PcI8086::s_pendingIRQIndex;
 bool                      PcI8086::s_halted;
+// Default to reporting a plain 8086 (FLAGS bits 12-15 read as 1 on PUSHF). This
+// core implements the 80186 instruction set but NOT the 80286 two-byte 0Fh
+// opcodes; a guest that detects a >=286 CPU and then executes e.g. SMSW (0F 01)
+// would desynchronize the decoder. Reporting 8086 keeps such guests on their
+// safe fallback path. Enable setReportAbove8086(true) only for titles verified
+// to gate on a >=286 CPU without issuing 0Fh instructions.
+bool                      PcI8086::s_reportAbove8086 = false;
+PcI8086::UnsupportedOpcode PcI8086::s_unsupportedOpcode = nullptr;
+bool                      PcI8086::s_emsActive = false;
+uint32_t                  PcI8086::s_emsBase = 0;
+uint32_t                  PcI8086::s_emsEnd = 0;
+PcI8086::ReadPort         PcI8086::s_emsRead = nullptr;
+PcI8086::WritePort        PcI8086::s_emsWrite = nullptr;
+
+void PcI8086::detach(void const * context)
+{
+  if (s_context != context)
+    return;
+  s_context = nullptr;
+  s_readPort = nullptr;
+  s_writePort = nullptr;
+  s_writeVideoMemory8 = nullptr;
+  s_writeVideoMemory16 = nullptr;
+  s_readVideoMemory8 = nullptr;
+  s_readVideoMemory16 = nullptr;
+  s_interrupt = nullptr;
+  s_memory = nullptr;
+  s_emsActive = false;
+  s_emsBase = 0;
+  s_emsEnd = 0;
+  s_emsRead = nullptr;
+  s_emsWrite = nullptr;
+  s_unsupportedOpcode = nullptr;
+}
 
 
 
@@ -510,6 +539,15 @@ uint16_t PcI8086::IP()
 }
 
 
+uint8_t PcI8086::currentOpcode()
+{
+  if (!s_memory)
+    return 0;
+  uint32_t const physical = (16u * regs16[REG_CS] + reg_ip) & PhysicalAddressMask;
+  return s_memory[physical];
+}
+
+
 void PcI8086::setSP(uint16_t value)
 {
   regs16[REG_SP] = value;
@@ -648,6 +686,14 @@ void PcI8086::setFlagCF(bool value)
 }
 
 
+void PcI8086::setFlagTF(bool value)
+{
+  FLAG_TF = value;
+  if (!value)
+    trapInhibit = false;
+}
+
+
 
 
 // ret false if not acked
@@ -672,17 +718,21 @@ void PcI8086::triggerInterrupt(uint8_t interrupt_num)
 /////////////////////////////////////////////////////////////////////////////
 
 
-// direct RAM/register-window access (not video RAM)
-#define MEM8(addr)  rawMem8(s_memory, addr)
-#define MEM16(addr) rawMem16(s_memory, addr)
+// Compatibility aliases for the decoder's legacy stack/vector sites. Both now
+// resolve through the same physical-memory path as ordinary operands.
+#define MEM8(addr)  RMEM8(addr)
+#define MEM16(addr) memoryWord(addr)
 
 
 uint8_t PcI8086::RMEM8(int addr)
 {
+  if (isRegsAddress(addr, 1))
+    return regs[addr - regs_offset];
+  addr &= PhysicalAddressMask;
   if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END) {
     return s_readVideoMemory8(s_context, addr);
-  } else if (isRegsAddress(addr, 1)) {
-    return rawMem8(s_memory, addr);
+  } else if (s_emsActive && static_cast<uint32_t>(addr) >= s_emsBase && static_cast<uint32_t>(addr) < s_emsEnd) {
+    return s_emsRead(s_context, addr);
   } else {
     return s_memory[addr];
   }
@@ -691,22 +741,43 @@ uint8_t PcI8086::RMEM8(int addr)
 
 uint16_t PcI8086::RMEM16(int addr)
 {
+  if (isRegsAddress(addr, 2))
+    return readUnalignedWord(regs + (addr - regs_offset));
+  addr &= PhysicalAddressMask;
+  bool const lowInEms = s_emsActive && static_cast<uint32_t>(addr) >= s_emsBase &&
+                        static_cast<uint32_t>(addr) < s_emsEnd;
+  bool const highInEms = s_emsActive && static_cast<uint32_t>(addr + 1) >= s_emsBase &&
+                         static_cast<uint32_t>(addr + 1) < s_emsEnd;
+  if (lowInEms != highInEms) {
+    // A word crossing either edge of the EMS frame belongs to two address
+    // spaces. Dispatch each byte independently so the non-EMS half reaches
+    // ordinary memory instead of being lost or redirected.
+    return static_cast<uint16_t>(RMEM8(addr) | (RMEM8(addr + 1) << 8));
+  }
   if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END) {
     return s_readVideoMemory16(s_context, addr);
-  } else if (isRegsAddress(addr, 2)) {
-    return rawMem16(s_memory, addr);
+  } else if (lowInEms) {
+    // Split into bytes so a word straddling a 16 KiB page boundary resolves each
+    // half through its own current mapping.
+    return static_cast<uint16_t>(s_emsRead(s_context, addr) | (s_emsRead(s_context, addr + 1) << 8));
   } else {
-    return *(uint16_t*)(s_memory + addr);
+    return static_cast<uint16_t>(s_memory[addr] |
+                                 (static_cast<uint16_t>(s_memory[(addr + 1) & PhysicalAddressMask]) << 8));
   }
 }
 
 
 inline __attribute__((always_inline)) uint8_t PcI8086::WMEM8(int addr, uint8_t value)
 {
+  if (isRegsAddress(addr, 1)) {
+    regs[addr - regs_offset] = value;
+    return value;
+  }
+  addr &= PhysicalAddressMask;
   if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END) {
     s_writeVideoMemory8(s_context, addr, value);
-  } else if (isRegsAddress(addr, 1)) {
-    rawMem8(s_memory, addr) = value;
+  } else if (s_emsActive && static_cast<uint32_t>(addr) >= s_emsBase && static_cast<uint32_t>(addr) < s_emsEnd) {
+    s_emsWrite(s_context, addr, value);
   } else {
     s_memory[addr] = value;
   }
@@ -714,14 +785,32 @@ inline __attribute__((always_inline)) uint8_t PcI8086::WMEM8(int addr, uint8_t v
 }
 
 
-inline __attribute__((always_inline)) uint16_t PcI8086::WMEM16(int addr, uint16_t value)
+uint16_t PcI8086::WMEM16(int addr, uint16_t value)
 {
+  if (isRegsAddress(addr, 2)) {
+    uint8_t * target = regs + (addr - regs_offset);
+    target[0] = static_cast<uint8_t>(value);
+    target[1] = static_cast<uint8_t>(value >> 8);
+    return value;
+  }
+  addr &= PhysicalAddressMask;
+  bool const lowInEms = s_emsActive && static_cast<uint32_t>(addr) >= s_emsBase &&
+                        static_cast<uint32_t>(addr) < s_emsEnd;
+  bool const highInEms = s_emsActive && static_cast<uint32_t>(addr + 1) >= s_emsBase &&
+                         static_cast<uint32_t>(addr + 1) < s_emsEnd;
+  if (lowInEms != highInEms) {
+    WMEM8(addr, static_cast<uint8_t>(value & 0xff));
+    WMEM8(addr + 1, static_cast<uint8_t>(value >> 8));
+    return value;
+  }
   if (addr >= VIDEOMEM_START && addr < VIDEOMEM_END) {
     s_writeVideoMemory16(s_context, addr, value);
-  } else if (isRegsAddress(addr, 2)) {
-    rawMem16(s_memory, addr) = value;
+  } else if (lowInEms) {
+    s_emsWrite(s_context, addr, static_cast<uint8_t>(value & 0xff));
+    s_emsWrite(s_context, addr + 1, static_cast<uint8_t>(value >> 8));
   } else {
-    *(uint16_t*)(s_memory + addr) = value;
+    s_memory[addr] = static_cast<uint8_t>(value);
+    s_memory[(addr + 1) & PhysicalAddressMask] = static_cast<uint8_t>(value >> 8);
   }
   return value;
 }
@@ -744,11 +833,10 @@ void set_AF_OF_arith(int32_t op_result)
 // Assemble and return emulated CPU FLAGS register
 uint16_t PcI8086::make_flags()
 {
-  #if I80186MODE
-  uint16_t r = 0x0002;    // to pass test186 tests, just unused bit nr. 1 is set to 1 (some programs checks this to know if this is a 80186 or 8086)
-  #else
-  uint16_t r = 0xf002;    // for real 8086
-  #endif
+  // Bits 12-15: an 8086 always reads them as 1 on PUSHF, whereas an 80186/80286
+  // in real mode reads them as 0. Guest CPU-detection code keys on exactly this,
+  // so the high nibble selects which part we impersonate.
+  uint16_t r = s_reportAbove8086 ? 0x0002 : 0xf002;
 
   return r | FLAG_CF << 0 | FLAG_PF << 2 | FLAG_AF << 4 | FLAG_ZF << 6 | FLAG_SF << 7 | FLAG_TF << 8 | FLAG_IF << 9 | FLAG_DF << 10 | FLAG_OF << 11;
 }
@@ -756,12 +844,17 @@ uint16_t PcI8086::make_flags()
 
 void PcI8086::set_flags(int new_flags)
 {
+  bool const oldTrapFlag = FLAG_TF;
   FLAG_CF = (bool)(new_flags & 0x001);
   FLAG_PF = (bool)(new_flags & 0x004);
   FLAG_AF = (bool)(new_flags & 0x010);
   FLAG_ZF = (bool)(new_flags & 0x040);
   FLAG_SF = (bool)(new_flags & 0x080);
   FLAG_TF = (bool)(new_flags & 0x100);
+  if (!FLAG_TF)
+    trapInhibit = false;
+  else if (!oldTrapFlag)
+    trapInhibit = true;
   FLAG_IF = (bool)(new_flags & 0x200);
   FLAG_DF = (bool)(new_flags & 0x400);
   FLAG_OF = (bool)(new_flags & 0x800);
@@ -793,16 +886,23 @@ void PcI8086::pc_interrupt(uint8_t interrupt_num)
     uint16_t newIP     = MEM16(4 * interrupt_num);
     uint16_t newCS     = MEM16(4 * interrupt_num + 2);
 
+    if (newIP == 0 && newCS == 0) {
+      printf("Null interrupt vector INT %02X from %04X:%04X ss:sp=%04X:%04X flags=%04X\n",
+             interrupt_num, regs16[REG_CS], reg_ip,
+             regs16[REG_SS], regs16[REG_SP], make_flags());
+    }
+
     regs16[REG_SP] -= 6;
-    uint16_t * stack = &MEM16(16 * regs16[REG_SS] + regs16[REG_SP]);
-    stack[2] = make_flags();
-    stack[1] = regs16[REG_CS];
-    stack[0] = reg_ip;
+    int const stack = 16 * regs16[REG_SS] + regs16[REG_SP];
+    MEM16(stack + 4) = make_flags();
+    MEM16(stack + 2) = regs16[REG_CS];
+    MEM16(stack) = reg_ip;
 
     reg_ip         = newIP;
     regs16[REG_CS] = newCS;
 
     FLAG_TF = FLAG_IF = 0;
+    trapInhibit = false;
   }
 }
 
@@ -874,6 +974,7 @@ void PcI8086::reset()
   rep_override_en = 0;
 
   s_halted = false;
+  trapInhibit = false;
 
   regs16[REG_CS] = 0xffff;
   reg_ip = 0;
@@ -883,11 +984,11 @@ void PcI8086::reset()
 // tries to make more compact opcode "switch"
 static uint8_t optcodes[] = {
 // 0    1   2   3   4   5   6   7   8   9   a   b   c   d   e   f
-   0,   0,  0,  0,  0,  0, 13, 12,  0,  0,  0,  0,  0,  0, 13,  0, // 00 - 0f
-   0,   0,  0,  0,  0,  0, 13, 12,  0,  0,  0,  0,  0,  0, 13, 12, // 10 - 1f
+   0,   0, 21,  0,  0,  0, 13, 12,  0,  0,  0,  0,  0,  0, 13,  0, // 00 - 0f
+   0,   0,  0, 22,  0,  0, 13, 12,  0,  0,  0,  0,  0,  0, 13, 12, // 10 - 1f
    0,   0,  0,  0,  0,  0,  1,  0,  0,  0,  0,  0,  0,  0,  1,  0, // 20 - 2f
    0,   0,  0,  0,  0,  0,  1,  0,  0,  0,  0,  0,  0,  0,  1,  0, // 30 - 3f
-   0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // 40 - 4f
+  20,  20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, // 40 - 4f
    9,   9,  9,  9,  9,  9,  9,  9,  8,  8,  8,  8,  8,  8,  8,  8, // 50 - 5f
    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // 60 - 6f
    2,   2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2,  2, // 70 - 7f
@@ -897,8 +998,8 @@ static uint8_t optcodes[] = {
    10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11, // b0 - bf
    0,   0,  0,  7,  0,  0,  0,  0,  0,  0,  0, 17,  0, 15,  0, 16, // c0 - cf
    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, // d0 - df
-   0,   0,  0,  5,  0,  0,  0,  0,  6,  0,  0,  3,  0,  0,  0,  0, // e0 - ef
-   0,   0, 14, 14,  0,  0,  0,  0,  4,  4,  4,  4,  4,  4,  0,  0, // f0 - ff
+  19,  19, 19,  5,  0,  0,  0,  0,  6,  0,  0,  3,  0,  0,  0,  0, // e0 - ef
+   0,   0, 14, 14,  0,  0,  0,  0,  4,  4,  4,  4,  4,  4, 23,  0, // f0 - ff
 };
 
 
@@ -914,7 +1015,10 @@ void PcI8086::step()
 
   // Application has set trap flag, so fire INT 1
   if (FLAG_TF && !seg_override_en && !rep_override_en) {
-    pc_interrupt(1);
+    if (trapInhibit)
+      trapInhibit = false;
+    else
+      pc_interrupt(1);
   }
   // Check for interrupts triggered by system interfaces
   else if (FLAG_IF && s_pendingIRQ && !seg_override_en && !rep_override_en) {
@@ -935,7 +1039,23 @@ void PcI8086::step()
     if (rep_override_en)
       --rep_override_en;
 
-    uint8_t const * opcode_stream = s_memory + 16 * regs16[REG_CS] + reg_ip;
+    uint32_t const instructionLinear = (16u * regs16[REG_CS] + reg_ip) & PhysicalAddressMask;
+    static constexpr uint32_t InstructionBytesNeeded = 6;
+    uint8_t fetchedInstruction[InstructionBytesNeeded];
+    bool const crossesAddressWrap = instructionLinear >
+                                    static_cast<uint32_t>(PhysicalAddressMask) - (InstructionBytesNeeded - 1);
+    bool const overlapsVideo = !crossesAddressWrap &&
+                               instructionLinear < VIDEOMEM_END &&
+                               instructionLinear + InstructionBytesNeeded > VIDEOMEM_START;
+    bool const overlapsEms = !crossesAddressWrap && s_emsActive &&
+                             instructionLinear < s_emsEnd &&
+                             instructionLinear + InstructionBytesNeeded > s_emsBase;
+    uint8_t const * opcode_stream = s_memory + instructionLinear;
+    if (crossesAddressWrap || overlapsVideo || overlapsEms) {
+      for (uint32_t i = 0; i < InstructionBytesNeeded; ++i)
+        fetchedInstruction[i] = RMEM8(static_cast<int>(instructionLinear + i));
+      opcode_stream = fetchedInstruction;
+    }
 
     // 80386 operand/address-size prefixes. TabDOS remains a 16-bit emulator,
     // but DOS runtimes can emit these harmlessly before byte-sized or
@@ -1042,7 +1162,7 @@ void PcI8086::step()
       case 6:
       {
         uint16_t pIP = reg_ip + 3;
-        reg_ip = pIP + *(uint16_t*)(opcode_stream + 1);
+        reg_ip = pIP + readUnalignedWord(opcode_stream + 1);
         regs16[REG_SP] -= 2;
         MEM16(16 * regs16[REG_SS] + regs16[REG_SP]) = pIP;
         return;
@@ -1081,7 +1201,7 @@ void PcI8086::step()
       // MOV reg16, data16
       // opcodes 0xb8 ... 0xbf
       case 11:
-        regs16[*opcode_stream & 0x7] = *(uint16_t*)(opcode_stream + 1);
+        regs16[*opcode_stream & 0x7] = readUnalignedWord(opcode_stream + 1);
         reg_ip += 3;
         return;
 
@@ -1127,10 +1247,13 @@ void PcI8086::step()
       // opcode 0xcf
       case 16:
       {
-        uint16_t * stack = &MEM16(16 * regs16[REG_SS] + regs16[REG_SP]);
-        reg_ip         = stack[0];
-        regs16[REG_CS] = stack[1];
-        set_flags(stack[2]);
+        int const stack = 16 * regs16[REG_SS] + regs16[REG_SP];
+        uint16_t const returnIp = MEM16(stack);
+        uint16_t const returnCs = MEM16(stack + 2);
+        uint16_t const returnFlags = MEM16(stack + 4);
+        reg_ip = returnIp;
+        regs16[REG_CS] = returnCs;
+        set_flags(returnFlags);
         regs16[REG_SP] += 6;
         return;
       }
@@ -1139,9 +1262,9 @@ void PcI8086::step()
       // opcode 0xcb
       case 17:
       {
-        uint16_t * stack = &MEM16(16 * regs16[REG_SS] + regs16[REG_SP]);
-        reg_ip         = stack[0];
-        regs16[REG_CS] = stack[1];
+        int const stack = 16 * regs16[REG_SS] + regs16[REG_SP];
+        reg_ip = MEM16(stack);
+        regs16[REG_CS] = MEM16(stack + 2);
         regs16[REG_SP] += 4;
         return;
       }
@@ -1150,6 +1273,106 @@ void PcI8086::step()
       case 18:
         stepEx(opcode_stream);
         break;  // reloop, this is required to inhibit interrupt until next instruction
+
+      // LOOPNZ / LOOPZ / LOOP
+      // opcodes 0xe0 ... 0xe2
+      case 19:
+      {
+        uint8_t const opcode = opcode_stream[0];
+        bool const countNotZero = --regs16[REG_CX] != 0;
+        bool const condition = opcode == 0xe2 || (opcode == 0xe1 ? FLAG_ZF : !FLAG_ZF);
+        reg_ip += 2 + (countNotZero && condition ? static_cast<int8_t>(opcode_stream[1]) : 0);
+        return;
+      }
+
+      // INC / DEC reg16
+      // opcodes 0x40 ... 0x4f
+      case 20:
+      {
+        uint8_t const opcode = opcode_stream[0];
+        uint16_t const before = regs16[opcode & 7];
+        bool const decrement = (opcode & 8) != 0;
+        uint16_t const result = static_cast<uint16_t>(before + (decrement ? -1 : 1));
+        regs16[opcode & 7] = result;
+        FLAG_AF = ((before ^ 1u ^ result) & 0x10u) != 0;
+        FLAG_OF = decrement ? before == 0x8000 : before == 0x7fff;
+        FLAG_SF = (result & 0x8000u) != 0;
+        FLAG_ZF = result == 0;
+        FLAG_PF = parity[static_cast<uint8_t>(result)];
+        ++reg_ip;
+        return;
+      }
+
+      // ADD r8, r/m8, register-only form used by the profiled KOEI loop.
+      case 21:
+      {
+        uint8_t const modrm = opcode_stream[1];
+        if ((modrm & 0xc0) != 0xc0) {
+          stepEx(opcode_stream);
+          return;
+        }
+        uint8_t & destination = regs8[(2 * ((modrm >> 3) & 7) + ((modrm >> 3) & 7) / 4) & 7];
+        uint8_t const sourceIndex = modrm & 7;
+        uint8_t const source = regs8[(2 * sourceIndex + sourceIndex / 4) & 7];
+        uint8_t const before = destination;
+        uint8_t const result = static_cast<uint8_t>(before + source);
+        destination = result;
+        FLAG_CF = result < before;
+        FLAG_AF = ((before ^ source ^ result) & 0x10u) != 0;
+        FLAG_OF = ((~(before ^ source) & (before ^ result)) & 0x80u) != 0;
+        FLAG_SF = (result & 0x80u) != 0;
+        FLAG_ZF = result == 0;
+        FLAG_PF = parity[result];
+        reg_ip += 2;
+        return;
+      }
+
+      // ADC r16, r/m16, register-only form used by the profiled KOEI loop.
+      case 22:
+      {
+        uint8_t const modrm = opcode_stream[1];
+        if ((modrm & 0xc0) != 0xc0) {
+          stepEx(opcode_stream);
+          return;
+        }
+        uint16_t & destination = regs16[(modrm >> 3) & 7];
+        uint16_t const source = regs16[modrm & 7];
+        uint16_t const before = destination;
+        uint32_t const sum = static_cast<uint32_t>(before) + source + FLAG_CF;
+        uint16_t const result = static_cast<uint16_t>(sum);
+        destination = result;
+        FLAG_CF = sum > 0xffffu;
+        FLAG_AF = ((before ^ source ^ result) & 0x10u) != 0;
+        FLAG_OF = ((~(before ^ source) & (before ^ result)) & 0x8000u) != 0;
+        FLAG_SF = (result & 0x8000u) != 0;
+        FLAG_ZF = result == 0;
+        FLAG_PF = parity[static_cast<uint8_t>(result)];
+        reg_ip += 2;
+        return;
+      }
+
+      // INC / DEC r/m8, register-only forms.
+      case 23:
+      {
+        uint8_t const modrm = opcode_stream[1];
+        uint8_t const operation = (modrm >> 3) & 7;
+        if ((modrm & 0xc0) != 0xc0 || operation > 1) {
+          stepEx(opcode_stream);
+          return;
+        }
+        uint8_t const registerIndex = modrm & 7;
+        uint8_t & destination = regs8[(2 * registerIndex + registerIndex / 4) & 7];
+        uint8_t const before = destination;
+        uint8_t const result = static_cast<uint8_t>(before + (operation ? -1 : 1));
+        destination = result;
+        FLAG_AF = ((before ^ 1u ^ result) & 0x10u) != 0;
+        FLAG_OF = operation ? before == 0x80 : before == 0x7f;
+        FLAG_SF = (result & 0x80u) != 0;
+        FLAG_ZF = result == 0;
+        FLAG_PF = parity[result];
+        reg_ip += 2;
+        return;
+      }
 
       default:
         stepEx(opcode_stream);
@@ -1237,7 +1460,8 @@ void PcI8086::stepEx(uint8_t const * opcode_stream)
         }
       } else if (i_reg != 6) {
         // JMP|CALL
-        uint16_t jumpTo = i_w ? MEM16(op_from_addr) : MEM8(op_from_addr);
+        uint16_t jumpTo = i_w ? static_cast<uint16_t>(MEM16(op_from_addr))
+                              : static_cast<uint16_t>(MEM8(op_from_addr));
         uint16_t farSegment = 0;
         if (i_reg & 1) {
           PSRAM_WORKAROUND2
@@ -1841,9 +2065,9 @@ void PcI8086::stepEx(uint8_t const * opcode_stream)
     case 32: // CALL FAR imm16:imm16
     {
       regs16[REG_SP] -= 4;
-      uint16_t * stack = &MEM16(16 * regs16[REG_SS] + regs16[REG_SP]);
-      stack[1] = regs16[REG_CS];
-      stack[0] = reg_ip + 5;
+      int const stack = 16 * regs16[REG_SS] + regs16[REG_SP];
+      MEM16(stack + 2) = regs16[REG_CS];
+      MEM16(stack) = reg_ip + 5;
       regs16[REG_CS]  = i_data2;
       reg_ip          = i_data0;
       return; // no calc ip, no flags
@@ -1927,7 +2151,8 @@ void PcI8086::stepEx(uint8_t const * opcode_stream)
         while (--level) {
           regs16[REG_BP] -= 2;
           regs16[REG_SP] -= 2;
-          MEM16(16 * regs16[REG_SS] + regs16[REG_SP]) = MEM16(16 * regs16[REG_SS] + regs16[REG_BP]);
+          uint16_t const parentFrame = MEM16(16 * regs16[REG_SS] + regs16[REG_BP]);
+          MEM16(16 * regs16[REG_SS] + regs16[REG_SP]) = parentFrame;
         }
         regs16[REG_SP] -= 2;
         MEM16(16 * regs16[REG_SS] + regs16[REG_SP]) = framePtr;
@@ -2142,7 +2367,10 @@ void PcI8086::stepEx(uint8_t const * opcode_stream)
       break;
       */
     default:
-      printf("Unsupported 8086 opcode %02X %02X\n", opcode_stream[0], opcode_stream[1]);
+      printf("Unsupported 8086 opcode %02X %02X at %04X:%04X\n",
+             opcode_stream[0], opcode_stream[1], regs16[REG_CS], reg_ip);
+      if (s_unsupportedOpcode)
+        s_unsupportedOpcode(s_context, regs16[REG_CS], reg_ip, opcode_stream[0], opcode_stream[1]);
       break;
   }
 

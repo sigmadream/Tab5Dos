@@ -4,6 +4,8 @@
 #include "pc_bios.h"
 #include "pc_i8086.h"
 #include "pc_keyboard_controller.h"
+#include "pc_mouse_cursor_overlay.h"
+#include "pc_opl2.h"
 #include "pc_text_renderer.h"
 
 #include <stddef.h>
@@ -42,12 +44,19 @@ public:
     uint64_t unsupportedPortWriteCount;
     uint8_t lastUnsupportedInterrupt;
     uint8_t lastUnsupportedInterruptAh;
+    uint16_t lastUnsupportedInterruptCs;
+    uint16_t lastUnsupportedInterruptIp;
     uint16_t lastUnsupportedPortRead;
     uint16_t lastUnsupportedPortWrite;
     uint64_t diskWriteCount;
     uint64_t lastDiskWriteLba;
     uint8_t lastDiskWriteCount;
     uint8_t lastDiskWriteDrive;
+    uint64_t unsupportedOpcodeCount;
+    uint16_t lastUnsupportedOpcodeCs;
+    uint16_t lastUnsupportedOpcodeIp;
+    uint8_t lastUnsupportedOpcode0;
+    uint8_t lastUnsupportedOpcode1;
   };
 
   struct VgaDacState {
@@ -108,6 +117,15 @@ public:
   static constexpr uint32_t DefaultBootLinearAddress = 0x00007c00;
   static constexpr int DiskCount = 4;
 
+  // LIM EMS 4.0 expanded memory subset: a 64 KiB page frame of four 16 KiB
+  // physical pages, backed by a PSRAM pool that DOS programs map via INT 67h.
+  static constexpr uint16_t EmsPageFrameSegment = 0xe000;
+  static constexpr uint8_t EmsVersion = 0x40;
+  static constexpr int EmsPhysicalPages = 4;
+  static constexpr int EmsLogicalPageSize = 16 * 1024;
+  static constexpr int EmsTotalPages = 256; // 4 MiB pool
+  static constexpr int EmsMaxHandles = 64;
+
   PcMachine();
   ~PcMachine();
 
@@ -162,6 +180,24 @@ public:
   void setMouseState(uint16_t x, uint16_t y, uint16_t buttons);
   void setMouseSourceState(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t buttons);
 
+  // PC speaker state derived from the 8254 channel 2 and PPI port 61h, consumed
+  // by the host audio task. speakerFrequency() returns 0 when the tone is off.
+  bool speakerEnabled() const;
+  uint32_t speakerFrequency() const;
+
+  // AdLib/OPL2 (ports 388h/389h). The audio thread copies the register file
+  // under the machine mutex (snapshotOpl2), then synthesizes without the mutex
+  // held (synthesizeOpl2) so FM rendering never stalls the emulated CPU.
+  // synthesizeOpl2 returns false when no voice is sounding.
+  void snapshotOpl2(Opl2::RegisterSnapshot * out) const { m_opl2.snapshotRegisters(out); }
+  bool synthesizeOpl2(Opl2::RegisterSnapshot const & snapshot, int16_t * out, int frames, uint32_t sampleRate)
+  {
+    return m_opl2.render(snapshot, out, frames, sampleRate);
+  }
+
+  bool emsAvailable() const { return m_emsPool != nullptr; }
+  bool handleEmsInterrupt();
+
   uint8_t readPort(uint16_t port);
   void writePort(uint16_t port, uint8_t value);
 
@@ -178,6 +214,8 @@ public:
   void writeVideoMemory8(uint32_t address, uint8_t value);
   void writeVideoMemory16(uint32_t address, uint16_t value);
 
+  MouseCursorOverlay computeMouseOverlay(int sourceWidth, int sourceHeight, bool textMode, int cellWidth, int cellHeight) const;
+
   uint8_t const * text80Buffer() const;
   void renderText80Frame(uint16_t * dest, int destPitchPixels) const;
   void renderText80Line(int y, uint16_t * dest) const;
@@ -191,6 +229,29 @@ public:
   void renderHerculesGraphicsLine(int y, uint16_t * dest) const;
 
 private:
+  void emsReset();
+  void setupEmsDriver();
+  int emsAllocateHandle(int pages);
+  bool emsFreeHandle(int handle);
+  int emsLogicalToPool(int handle, int logicalPage) const;
+  void emsMapPage(int physPage, int handle, int logicalPage);
+  int emsFreePageCount() const;
+  int emsActiveHandleCount() const;
+  bool emsWindowActive() const;
+  void updateEmsWindowActive();
+  static uint8_t emsReadCallback(void * context, int address);
+  static void emsWriteCallback(void * context, int address, uint8_t value);
+
+  void pitReset();
+  void pitWriteCommand(uint8_t value);
+  void pitWriteData(int channel, uint8_t value);
+  uint8_t pitReadData(int channel);
+  void pitLatch(int channel);
+  uint16_t pitCurrentCount(int channel) const;
+  uint32_t pitDivisor(int channel) const;
+  void onPitReload(int channel);
+  void serviceTimerInterrupt();
+
   static bool isRangeValid(uint32_t address, size_t size, size_t limit);
   static uint8_t readPortCallback(void * context, int address);
   static void writePortCallback(void * context, int address, uint8_t value);
@@ -199,6 +260,7 @@ private:
   static void writeVideoMemory8Callback(void * context, int address, uint8_t value);
   static void writeVideoMemory16Callback(void * context, int address, uint16_t value);
   static bool interruptCallback(void * context, int interruptNumber);
+  static void unsupportedOpcodeCallback(void * context, uint16_t cs, uint16_t ip, uint8_t op0, uint8_t op1);
   void recordUnsupportedInterrupt(int interruptNumber);
   void recordUnsupportedPortRead(uint16_t port);
   void recordUnsupportedPortWrite(uint16_t port);
@@ -268,9 +330,20 @@ private:
   uint8_t * m_ram;
   uint8_t * m_videoMemory;
   uint8_t * m_vgaPlaneMemory;
+  uint8_t * m_emsPool;
+  int m_emsPageOwner[EmsTotalPages];
+  bool m_emsHandleActive[EmsMaxHandles + 1];
+  int m_emsHandlePageCount[EmsMaxHandles + 1];
+  int m_emsPhysMapHandle[EmsPhysicalPages];
+  int m_emsPhysMapLogical[EmsPhysicalPages];
+  int m_emsPhysMapPoolPage[EmsPhysicalPages]; // cached O(1) pool page per slot, -1 unmapped
+  bool m_emsSaved[EmsMaxHandles + 1];
+  int m_emsSavedHandle[EmsMaxHandles + 1][EmsPhysicalPages];
+  int m_emsSavedLogical[EmsMaxHandles + 1][EmsPhysicalPages];
   PcKeyboardController m_keyboard;
   PcBios m_bios;
   PcTextRenderer m_textRenderer;
+  Opl2 m_opl2;
   PcDiskImage m_disks[DiskCount];
   BootState m_bootState;
   Diagnostics m_diagnostics;
@@ -281,10 +354,24 @@ private:
   uint8_t m_port61;
   uint8_t m_floppyDigitalOutputRegister;
   uint8_t m_cmosIndex;
-  uint16_t m_pitCounter;
-  bool m_pitReadLow;
+  // 8253/8254 Programmable Interval Timer. Channel 0 drives IRQ0 at its
+  // programmed frequency, channel 2 gates the PC speaker. Counts are derived
+  // from wall-clock time so guest delay loops and reprogrammed timer music work.
+  struct PitChannel {
+    uint16_t reloadValue;   // 0 represents the full 65536 divisor
+    uint16_t latchValue;    // value captured by a latch command
+    bool latched;           // a latched value is pending readback
+    uint8_t accessMode;     // 1=lobyte, 2=hibyte, 3=lobyte/hibyte
+    uint8_t operatingMode;  // 0..5 (modes 6/7 alias 2/3)
+    bool bcd;
+    bool writeHigh;         // next write is the high byte (access mode 3)
+    bool readHigh;          // next read is the high byte (access mode 3)
+    bool gate;              // gate input (channel 2 tied to port 61h bit 0)
+    uint64_t phaseBaseMicros;
+  };
+  PitChannel m_pit[3];
+  uint64_t m_pitChannel0NextIrqMicros;
   int m_timerUpdateCountdown;
-  uint32_t m_lastTimerIrqTick;
   uint8_t m_colorCrtcIndex;
   uint8_t m_colorCrtcRegisters[32];
   uint8_t m_cgaModeControl;

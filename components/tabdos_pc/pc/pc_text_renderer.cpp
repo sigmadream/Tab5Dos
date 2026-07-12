@@ -41,6 +41,49 @@ void PcTextRenderer::setFont(Font8x16 font)
   }
 }
 
+uint64_t PcTextRenderer::stateHash() const
+{
+  uint64_t h = 1469598103934665603ull;
+  auto fold = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  fold(m_font.glyphCount);
+  if (m_font.data) {
+    size_t const renderedGlyphs = m_font.glyphCount < 256 ? m_font.glyphCount : 256;
+    for (size_t i = 0; i < renderedGlyphs * CellHeight; ++i)
+      fold(m_font.data[i]);
+  }
+  fold(m_vgaCharacterMapClear);
+  fold(m_vgaCharacterMapSet);
+  fold(m_underlineLocation);
+  fold(m_vgaFontSelectionEnabled);
+  if (m_vgaFontSelectionEnabled) {
+    uint8_t const maps[2] = {m_vgaCharacterMapClear, m_vgaCharacterMapSet};
+    for (uint8_t map : maps) {
+      uint32_t const base = characterMapOffset(map);
+      for (uint32_t character = 0; character < 256; ++character)
+        for (uint32_t row = 0; row < 32; ++row)
+          fold(m_vgaFontPlane[(base + character * 32u + row) & 0xffff]);
+    }
+  }
+  fold(static_cast<uint64_t>(m_columns));
+  fold(static_cast<uint64_t>(m_cellHeight));
+  fold(static_cast<uint64_t>(m_rows));
+  fold(static_cast<uint64_t>(m_cursorRow));
+  fold(static_cast<uint64_t>(m_cursorColumn));
+  fold(m_cursorStart);
+  fold(m_cursorEnd);
+  fold(m_cursorVisible);
+  fold(m_blinkEnabled);
+  fold(m_displayEnabled);
+  fold(m_lineGraphicsEnabled);
+  fold(m_nineDotTextMode);
+  fold(m_horizontalPanning);
+  fold(m_frameCounter);
+  for (int i = 0; i < 16; ++i)
+    fold(m_palette[i]);
+  fold(m_overscanColor);
+  return h;
+}
+
 uint8_t PcTextRenderer::characterMapIfAttributeClear(uint8_t characterMapSelect)
 {
   return static_cast<uint8_t>((characterMapSelect & 0x03) | ((characterMapSelect >> 2) & 0x04));
