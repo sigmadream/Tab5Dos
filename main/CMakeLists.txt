@@ -17,8 +17,12 @@ idf_component_register(
         esp_codec_dev
 )
 
-target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_17)
+target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_20)
 
 if(DEFINED ENV{TABDOS_AUTOTEST_KEYS})
     target_compile_definitions(${COMPONENT_LIB} PRIVATE TABDOS_AUTOTEST_KEYS=1)
+endif()
+
+if(DEFINED ENV{TABDOS_CPU_PROFILE})
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE TABDOS_CPU_PROFILE=1)
 endif()

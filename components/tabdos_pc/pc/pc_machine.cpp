@@ -1234,7 +1234,7 @@ uint8_t PcMachine::readPort(uint16_t port)
     case 0x0080: // POST/ISA diagnostic delay port; no device state
       return 0x00;
     case 0x0092: // PS/2 system-control port A / fast A20 gate
-      return 0x02; // A20 appears enabled; reset bit clear
+      return 0x00; // A20 disabled; reset bit clear (only a 1 MiB aperture exists)
     case 0x00f9: // emulator/debug port used by some DOS probes; keep quiet
       return 0x00;
     case 0x2861: // chipset/video probe port observed in DOS applications
@@ -1376,8 +1376,8 @@ void PcMachine::writePort(uint16_t port, uint8_t value)
     case 0x0080: // POST/ISA diagnostic delay port
       break;
     case 0x0092: // PS/2 system-control port A / fast A20 gate
-      // Memory above 1 MiB is not exposed, so fast-A20 toggles are accepted as
-      // harmless no-ops. Ignore bit 0 to avoid guest-triggered reset loops.
+      // Memory above 1 MiB is not exposed. Keep A20 disabled and ignore bit 0
+      // to avoid guest-triggered reset loops.
       break;
     case 0x00f9: // emulator/debug port used by some DOS probes; keep quiet
       break;
@@ -1812,11 +1812,11 @@ void PcMachine::vgaWritePlaneByte(uint32_t offset, uint8_t value, uint8_t planeM
   }
 }
 
-PcMachine::MouseCursorOverlay PcMachine::computeMouseOverlay(int sourceWidth,
-                                                             int sourceHeight,
-                                                             bool textMode,
-                                                             int cellWidth,
-                                                             int cellHeight) const
+MouseCursorOverlay PcMachine::computeMouseOverlay(int sourceWidth,
+                                                  int sourceHeight,
+                                                  bool textMode,
+                                                  int cellWidth,
+                                                  int cellHeight) const
 {
   MouseCursorOverlay overlay;
   PcBios::MouseRenderInfo const info = m_bios.mouseRenderInfo();
@@ -2905,6 +2905,8 @@ void PcMachine::recordUnsupportedInterrupt(int interruptNumber)
   ++m_diagnostics.unsupportedInterruptCount;
   m_diagnostics.lastUnsupportedInterrupt = static_cast<uint8_t>(interruptNumber);
   m_diagnostics.lastUnsupportedInterruptAh = PcI8086::AH();
+  m_diagnostics.lastUnsupportedInterruptCs = PcI8086::CS();
+  m_diagnostics.lastUnsupportedInterruptIp = PcI8086::IP();
 }
 
 void PcMachine::unsupportedOpcodeCallback(void * context, uint16_t cs, uint16_t ip, uint8_t op0, uint8_t op1)
@@ -3429,7 +3431,7 @@ bool PcMachine::handleEmsInterrupt()
       PcI8086::setAH(emsFreeHandle(PcI8086::DX()) ? 0x00 : 0x83);
       return true;
     case 0x46: // get EMM version
-      PcI8086::setAL(0x32); // version 3.2
+      PcI8086::setAL(EmsVersion);
       PcI8086::setAH(0x00);
       return true;
     case 0x47: // save page map
@@ -3489,6 +3491,25 @@ bool PcMachine::handleEmsInterrupt()
         }
       }
       PcI8086::setBX(static_cast<uint16_t>(count));
+      PcI8086::setAH(0x00);
+      return true;
+    }
+    case 0x58: // get mappable physical address array
+    {
+      uint8_t const subfunction = PcI8086::AL();
+      if (subfunction == 0x00) {
+        uint32_t dest = (static_cast<uint32_t>(PcI8086::ES()) << 4) + PcI8086::DI();
+        for (int page = 0; page < EmsPhysicalPages; ++page) {
+          uint16_t const segment = static_cast<uint16_t>(EmsPageFrameSegment +
+                                                         page * (EmsLogicalPageSize >> 4));
+          writeMemory16(dest + static_cast<uint32_t>(page) * 4, segment);
+          writeMemory16(dest + static_cast<uint32_t>(page) * 4 + 2, static_cast<uint16_t>(page));
+        }
+      } else if (subfunction != 0x01) {
+        PcI8086::setAH(0x8f); // undefined subfunction
+        return true;
+      }
+      PcI8086::setCX(EmsPhysicalPages);
       PcI8086::setAH(0x00);
       return true;
     }

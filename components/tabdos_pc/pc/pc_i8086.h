@@ -125,8 +125,10 @@ public:
 
   static void setFlagZF(bool value);
   static void setFlagCF(bool value);
+  static void setFlagTF(bool value);
 
   static uint16_t IP();
+  static uint8_t currentOpcode();
 
   static bool halted()                                    { return s_halted; }
 

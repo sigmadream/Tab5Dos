@@ -4,6 +4,7 @@
 #include "tab5_usb_keyboard.h"
 
 #include "pc/pc_disk_catalog.h"
+#include "pc/pc_i8086.h"
 #include "pc/pc_machine.h"
 
 #include "bsp/esp-bsp.h"
@@ -18,10 +19,16 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <algorithm>
+#include <atomic>
 #include <ctype.h>
 #include <string>
 #include <string.h>
 #include <sys/stat.h>
+
+#ifndef TABDOS_CPU_PROFILE
+#define TABDOS_CPU_PROFILE 0
+#endif
 
 namespace {
 static char const * TAG = "tabdos_tab5";
@@ -66,6 +73,119 @@ struct ScreenMilestones {
   bool writeFile;
 };
 
+#if TABDOS_CPU_PROFILE
+static constexpr uint32_t CpuProfileSampleMask = 63; // time one instruction out of 64
+static constexpr int CpuProfilePcSlots = 512;
+static constexpr int CpuProfileTopEntries = 8;
+
+struct OpcodeProfileEntry {
+  uint64_t executions;
+  uint64_t timedSamples;
+  uint64_t timedMicroseconds;
+  uint32_t maxMicroseconds;
+};
+
+struct PcProfileEntry {
+  uint32_t key;
+  uint64_t samples;
+  uint64_t timedMicroseconds;
+  uint32_t maxMicroseconds;
+  uint8_t opcode;
+  bool occupied;
+};
+
+static OpcodeProfileEntry s_opcodeProfile[256];
+static PcProfileEntry s_pcProfile[CpuProfilePcSlots];
+static uint32_t s_profileSequence;
+
+static void resetCpuProfile()
+{
+  memset(s_opcodeProfile, 0, sizeof(s_opcodeProfile));
+  memset(s_pcProfile, 0, sizeof(s_pcProfile));
+}
+
+static void recordPcProfile(uint16_t cs, uint16_t ip, uint8_t opcode, uint32_t elapsedUs)
+{
+  uint32_t const key = (static_cast<uint32_t>(cs) << 16) | ip;
+  uint32_t slot = (key * 2654435761u) & (CpuProfilePcSlots - 1);
+  for (int probe = 0; probe < CpuProfilePcSlots; ++probe) {
+    PcProfileEntry & entry = s_pcProfile[slot];
+    if (!entry.occupied || entry.key == key) {
+      if (!entry.occupied) {
+        entry.occupied = true;
+        entry.key = key;
+        entry.opcode = opcode;
+      }
+      ++entry.samples;
+      entry.timedMicroseconds += elapsedUs;
+      entry.maxMicroseconds = std::max(entry.maxMicroseconds, elapsedUs);
+      return;
+    }
+    slot = (slot + 1) & (CpuProfilePcSlots - 1);
+  }
+}
+
+static void logCpuProfile(uint64_t intervalSteps)
+{
+  uint64_t totalTimedMicroseconds = 0;
+  for (OpcodeProfileEntry const & entry : s_opcodeProfile)
+    totalTimedMicroseconds += entry.timedMicroseconds;
+
+  bool selectedOpcode[256] = {};
+  for (int rank = 0; rank < CpuProfileTopEntries; ++rank) {
+    int best = -1;
+    for (int opcode = 0; opcode < 256; ++opcode) {
+      if (!selectedOpcode[opcode] && s_opcodeProfile[opcode].timedSamples != 0 &&
+          (best < 0 || s_opcodeProfile[opcode].timedMicroseconds > s_opcodeProfile[best].timedMicroseconds ||
+           (s_opcodeProfile[opcode].timedMicroseconds == s_opcodeProfile[best].timedMicroseconds &&
+            s_opcodeProfile[opcode].executions > s_opcodeProfile[best].executions)))
+        best = opcode;
+    }
+    if (best < 0)
+      break;
+    selectedOpcode[best] = true;
+    OpcodeProfileEntry const & entry = s_opcodeProfile[best];
+    double const percent = intervalSteps ? 100.0 * static_cast<double>(entry.executions) / intervalSteps : 0.0;
+    double const averageUs = entry.timedSamples
+                                 ? static_cast<double>(entry.timedMicroseconds) / entry.timedSamples
+                                 : 0.0;
+    double const timePercent = totalTimedMicroseconds
+                                   ? 100.0 * static_cast<double>(entry.timedMicroseconds) /
+                                         static_cast<double>(totalTimedMicroseconds)
+                                   : 0.0;
+    ESP_LOGI(TAG,
+             "PROFILE OP rank=%d op=%02x exec=%llu %.1f%% samples=%llu time=%.1f%% avg=%.2fus max=%uus",
+             rank + 1, best, static_cast<unsigned long long>(entry.executions), percent,
+             static_cast<unsigned long long>(entry.timedSamples), timePercent, averageUs,
+             entry.maxMicroseconds);
+  }
+
+  bool selectedPc[CpuProfilePcSlots] = {};
+  for (int rank = 0; rank < CpuProfileTopEntries; ++rank) {
+    int best = -1;
+    for (int slot = 0; slot < CpuProfilePcSlots; ++slot) {
+      if (s_pcProfile[slot].occupied && !selectedPc[slot] &&
+          (best < 0 || s_pcProfile[slot].timedMicroseconds > s_pcProfile[best].timedMicroseconds ||
+           (s_pcProfile[slot].timedMicroseconds == s_pcProfile[best].timedMicroseconds &&
+            s_pcProfile[slot].samples > s_pcProfile[best].samples)))
+        best = slot;
+    }
+    if (best < 0)
+      break;
+    selectedPc[best] = true;
+    PcProfileEntry const & entry = s_pcProfile[best];
+    double const averageUs = entry.samples
+                                 ? static_cast<double>(entry.timedMicroseconds) / entry.samples
+                                 : 0.0;
+    ESP_LOGI(TAG,
+             "PROFILE PC rank=%d at=%04x:%04x op=%02x samples=%llu total=%lluus avg=%.2fus max=%uus",
+             rank + 1, static_cast<unsigned>(entry.key >> 16), static_cast<unsigned>(entry.key & 0xffff),
+             entry.opcode, static_cast<unsigned long long>(entry.samples),
+             static_cast<unsigned long long>(entry.timedMicroseconds), averageUs, entry.maxMicroseconds);
+  }
+}
+#endif
+
 struct AppState {
   tabdos::PcMachine machine;
   Tab5LcdText display;
@@ -83,7 +203,7 @@ struct AppState {
   TickType_t syntheticKeyNextPressAt = 0;
   // Set by the touch task on a corner long-press; the display task services it
   // by dumping the current PC frame over serial, then clears it.
-  volatile bool screenshotRequested = false;
+  std::atomic_bool screenshotRequested{false};
 };
 
 struct BootDiskSelection {
@@ -540,6 +660,14 @@ static esp_err_t bootDefaultImage(AppState & app, std::string * imagePath)
   logHeapSnapshot("before PcMachine init");
   ESP_RETURN_ON_FALSE(app.machine.init(), ESP_ERR_NO_MEM, TAG, "PcMachine init failed");
   logHeapSnapshot("after PcMachine init");
+  if (app.machine.emsAvailable()) {
+    ESP_LOGI(TAG,
+             "EMS: LIM %u.%u, %u KiB, page frame %04x",
+             tabdos::PcMachine::EmsVersion >> 4,
+             tabdos::PcMachine::EmsVersion & 0x0f,
+             tabdos::PcMachine::EmsTotalPages * tabdos::PcMachine::EmsLogicalPageSize / 1024,
+             tabdos::PcMachine::EmsPageFrameSegment);
+  }
 
   std::string path;
   ESP_RETURN_ON_FALSE(tabdos::PcDiskCatalog::chooseDefaultImage(tabdos::PcDiskCatalog::DefaultDirectory, &path),
@@ -579,10 +707,33 @@ static void cpuTask(void * arg)
   int slicesSinceDelay = 0;
   uint64_t stepsSincePerfLog = 0;
   TickType_t nextPerfLog = xTaskGetTickCount() + PerfLogInterval;
+#if TABDOS_CPU_PROFILE
+  resetCpuProfile();
+#endif
   while (true) {
     xSemaphoreTake(app->mutex, portMAX_DELAY);
-    for (int i = 0; i < CpuStepsPerSlice; ++i)
+    for (int i = 0; i < CpuStepsPerSlice; ++i) {
+#if TABDOS_CPU_PROFILE
+      uint8_t const opcode = tabdos::PcI8086::currentOpcode();
+      ++s_opcodeProfile[opcode].executions;
+      if ((s_profileSequence++ & CpuProfileSampleMask) == 0) {
+        uint16_t const cs = tabdos::PcI8086::CS();
+        uint16_t const ip = tabdos::PcI8086::IP();
+        int64_t const startUs = esp_timer_get_time();
+        app->machine.stepCpu();
+        uint32_t const elapsedUs = static_cast<uint32_t>(esp_timer_get_time() - startUs);
+        OpcodeProfileEntry & entry = s_opcodeProfile[opcode];
+        ++entry.timedSamples;
+        entry.timedMicroseconds += elapsedUs;
+        entry.maxMicroseconds = std::max(entry.maxMicroseconds, elapsedUs);
+        recordPcProfile(cs, ip, opcode, elapsedUs);
+      } else {
+        app->machine.stepCpu();
+      }
+#else
       app->machine.stepCpu();
+#endif
+    }
     tabdos::PcMachine::Diagnostics diagnostics = app->machine.diagnostics();
     TickType_t const now = xTaskGetTickCount();
     if (diagnostics.diskWriteCount != flushedDiskWriteCount && now >= nextDiskFlush) {
@@ -630,12 +781,14 @@ static void cpuTask(void * arg)
     }
     if (changed && (diagnostics.unsupportedInterruptCount || diagnostics.unsupportedPortReadCount || diagnostics.unsupportedPortWriteCount)) {
       ESP_LOGW(TAG,
-               "diagnostic int=%llu portR=%llu portW=%llu lastInt=%02x ah=%02x read=%04x write=%04x",
+               "diagnostic int=%llu portR=%llu portW=%llu lastInt=%02x ah=%02x at %04x:%04x read=%04x write=%04x",
                static_cast<unsigned long long>(diagnostics.unsupportedInterruptCount),
                static_cast<unsigned long long>(diagnostics.unsupportedPortReadCount),
                static_cast<unsigned long long>(diagnostics.unsupportedPortWriteCount),
                diagnostics.lastUnsupportedInterrupt,
                diagnostics.lastUnsupportedInterruptAh,
+               diagnostics.lastUnsupportedInterruptCs,
+               diagnostics.lastUnsupportedInterruptIp,
                diagnostics.lastUnsupportedPortRead,
                diagnostics.lastUnsupportedPortWrite);
       lastDiagnostics = diagnostics;
@@ -648,7 +801,13 @@ static void cpuTask(void * arg)
         ESP_LOGI(TAG, "CPU throughput: %.2f MIPS (%llu steps / %u ms)",
                  mips, static_cast<unsigned long long>(stepsSincePerfLog), elapsedMs);
       }
+#if TABDOS_CPU_PROFILE
+      logCpuProfile(stepsSincePerfLog);
+#endif
       stepsSincePerfLog = 0;
+#if TABDOS_CPU_PROFILE
+      resetCpuProfile();
+#endif
       nextPerfLog = now + PerfLogInterval;
     }
     ++slicesSinceDelay;
@@ -665,15 +824,15 @@ static void speakerTask(void * arg)
 {
   auto * app = static_cast<AppState *>(arg);
   static int16_t oplBuffer[Tab5Speaker::ChunkFrames];
-  static uint8_t oplRegs[256];
+  static tabdos::Opl2::RegisterSnapshot oplSnapshot = {};
   while (true) {
     // Copy only the small register file and speaker state under the mutex; the
     // expensive FM synthesis runs outside it so it never stalls the CPU task.
     xSemaphoreTake(app->mutex, portMAX_DELAY);
     uint32_t const frequency = app->machine.speakerFrequency();
-    app->machine.snapshotOpl2(oplRegs);
+    app->machine.snapshotOpl2(&oplSnapshot);
     xSemaphoreGive(app->mutex);
-    bool const oplActive = app->machine.synthesizeOpl2(oplRegs, oplBuffer, Tab5Speaker::ChunkFrames, Tab5Speaker::SampleRate);
+    bool const oplActive = app->machine.synthesizeOpl2(oplSnapshot, oplBuffer, Tab5Speaker::ChunkFrames, Tab5Speaker::SampleRate);
     // playChunk blocks for ~one chunk of audio, pacing this loop to real time.
     app->speaker.playChunk(frequency, oplActive ? oplBuffer : nullptr);
   }
@@ -713,7 +872,7 @@ static void displayTask(void * arg)
   while (true) {
     tabdos::PcTextRenderer rendererSnapshot;
     tabdos::PcMachine::VideoMode videoMode = tabdos::PcMachine::VideoMode::Text80;
-    tabdos::PcMachine::MouseCursorOverlay cursorOverlay;
+    tabdos::MouseCursorOverlay cursorOverlay;
     int graphicsWidth = 0;
     int graphicsHeight = 0;
     xSemaphoreTake(app->mutex, portMAX_DELAY);
@@ -752,8 +911,7 @@ static void displayTask(void * arg)
 
     // Service a pending screenshot from the same task that owns the source
     // buffers, so the frame is not rewritten mid-dump.
-    if (app->screenshotRequested) {
-      app->screenshotRequested = false;
+    if (app->screenshotRequested.exchange(false, std::memory_order_acq_rel)) {
       esp_err_t const shotErr = app->display.dumpSourceFrameBase64();
       if (shotErr != ESP_OK)
         ESP_LOGW(TAG, "screenshot dump skipped: %s", esp_err_to_name(shotErr));
@@ -811,7 +969,7 @@ static void touchMouseTask(void * arg)
         screenshotFired = false;
         screenshotPressStart = nowTick;
       } else if (!screenshotFired && (nowTick - screenshotPressStart) >= ScreenshotHoldDelay) {
-        app->screenshotRequested = true;
+        app->screenshotRequested.store(true, std::memory_order_release);
         screenshotFired = true;
         ESP_LOGI(TAG, "screenshot requested via corner long-press");
       }

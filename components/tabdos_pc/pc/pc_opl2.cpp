@@ -32,9 +32,11 @@ float sustainLevel(uint8_t sl)
 
 } // namespace
 
-Opl2::Opl2()
+Opl2::Opl2() : m_resetGeneration(0), m_renderGeneration(0)
 {
   reset();
+  resetSynthesisState();
+  m_renderGeneration = m_resetGeneration;
 }
 
 void Opl2::reset()
@@ -42,10 +44,7 @@ void Opl2::reset()
   memset(m_registers, 0, sizeof(m_registers));
   m_address = 0;
   m_status = 0;
-  for (int i = 0; i < OperatorSlots; ++i)
-    m_operators[i] = Operator{0.0f, 0.0f, EnvPhase::Off, 0.0f};
-  for (int c = 0; c < Channels; ++c)
-    m_channelKeyOn[c] = false;
+  ++m_resetGeneration;
   m_timer1Running = false;
   m_timer2Running = false;
   m_timer1Masked = false;
@@ -54,14 +53,25 @@ void Opl2::reset()
   m_timer2StartMicros = 0;
 }
 
+void Opl2::resetSynthesisState()
+{
+  for (int i = 0; i < OperatorSlots; ++i)
+    m_operators[i] = Operator{0.0f, 0.0f, EnvPhase::Off, 0.0f};
+  for (int c = 0; c < Channels; ++c)
+    m_channelKeyOn[c] = false;
+}
+
 void Opl2::writeData(uint8_t value, uint64_t nowMicros)
 {
   writeRegister(m_address, value, nowMicros);
 }
 
-void Opl2::snapshotRegisters(uint8_t out[256]) const
+void Opl2::snapshotRegisters(RegisterSnapshot * out) const
 {
-  memcpy(out, m_registers, sizeof(m_registers));
+  if (!out)
+    return;
+  memcpy(out->registers, m_registers, sizeof(m_registers));
+  out->resetGeneration = m_resetGeneration;
 }
 
 void Opl2::writeRegister(uint8_t reg, uint8_t value, uint64_t nowMicros)
@@ -184,10 +194,15 @@ bool Opl2::anyKeyOn() const
   return false;
 }
 
-bool Opl2::render(uint8_t const * regs, int16_t * out, int frames, uint32_t sampleRate)
+bool Opl2::render(RegisterSnapshot const & snapshot, int16_t * out, int frames, uint32_t sampleRate)
 {
-  if (!regs || !out || frames <= 0 || sampleRate == 0)
+  if (!out || frames <= 0 || sampleRate == 0)
     return false;
+  if (snapshot.resetGeneration != m_renderGeneration) {
+    resetSynthesisState();
+    m_renderGeneration = snapshot.resetGeneration;
+  }
+  uint8_t const * regs = snapshot.registers;
 
   // Detect key-on/off edges from the register snapshot (B0-B8 bit 5). This is
   // the only place DSP state is keyed, keeping the audio thread free of the
@@ -268,9 +283,9 @@ bool Opl2::render(uint8_t const * regs, int16_t * out, int frames, uint32_t samp
                          bool egSustain) {
     switch (op.envPhase) {
       case EnvPhase::Attack:
-        op.envLevel += attack;
         if (attack <= 0.0f)
-          op.envLevel = 1.0f; // instantaneous attack when rate is maximal-ish
+          break; // AR=0 holds the envelope at its current level indefinitely
+        op.envLevel += attack;
         if (op.envLevel >= 1.0f) {
           op.envLevel = 1.0f;
           op.envPhase = EnvPhase::Decay;

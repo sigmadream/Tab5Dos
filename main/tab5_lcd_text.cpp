@@ -98,8 +98,7 @@ esp_err_t Tab5LcdText::clear(uint16_t color)
 {
   ESP_RETURN_ON_FALSE(m_panel, ESP_ERR_INVALID_STATE, TAG, "display not initialized");
   std::fill(m_frame, m_frame + OutputWidth * OutputHeight, color);
-  m_haveFrameHash = false;
-  m_haveTextInputHash = false;
+  m_presentedFrame.invalidate();
   return drawOutput();
 }
 
@@ -114,20 +113,6 @@ uint64_t Tab5LcdText::hashSource(uint16_t const * source, int width, int height)
   for (int i = 0; i < count; ++i)
     hash = (hash ^ source[i]) * 1099511628211ull;
   return hash;
-}
-
-bool Tab5LcdText::frameUnchanged(uint16_t const * source, int width, int height, uint64_t * hashOut)
-{
-  uint64_t const hash = hashSource(source, width, height);
-  if (hashOut)
-    *hashOut = hash;
-  return m_haveFrameHash && hash == m_lastFrameHash;
-}
-
-void Tab5LcdText::commitFrameHash(uint64_t hash)
-{
-  m_lastFrameHash = hash;
-  m_haveFrameHash = true;
 }
 
 esp_err_t Tab5LcdText::showStatus(char const * line1, char const * line2)
@@ -145,8 +130,7 @@ esp_err_t Tab5LcdText::showStatus(char const * line1, char const * line2)
   renderer.setCursor(0, 0, false);
   renderer.renderFrame9Dot(m_statusText, m_sourceFrame, TextSourceWidth);
   drawFrame(m_sourceFrame, TextSourceWidth, TextSourceHeight);
-  m_haveFrameHash = false;
-  m_haveTextInputHash = false;
+  m_presentedFrame.invalidate();
   return drawOutput();
 }
 
@@ -278,7 +262,7 @@ void Tab5LcdText::drawFrame(uint16_t const * source, int sourceWidth, int source
 void Tab5LcdText::applyMouseCursor(uint16_t * buffer,
                                   int width,
                                   int height,
-                                  tabdos::PcMachine::MouseCursorOverlay const & cursor)
+                                  tabdos::MouseCursorOverlay const & cursor)
 {
   if (!buffer || !cursor.visible || width <= 0 || height <= 0)
     return;
@@ -329,7 +313,7 @@ void Tab5LcdText::applyMouseCursor(uint16_t * buffer,
 
 esp_err_t Tab5LcdText::blitText80(tabdos::PcTextRenderer const & renderer,
                                   uint8_t const * text80Buffer,
-                                  tabdos::PcMachine::MouseCursorOverlay const & cursor)
+                                  tabdos::MouseCursorOverlay const & cursor)
 {
   ESP_RETURN_ON_FALSE(m_panel && m_sourceFrame && m_frame, ESP_ERR_INVALID_STATE, TAG, "display not initialized");
   ESP_RETURN_ON_FALSE(text80Buffer, ESP_ERR_INVALID_ARG, TAG, "missing text buffer");
@@ -346,7 +330,7 @@ esp_err_t Tab5LcdText::blitText80(tabdos::PcTextRenderer const & renderer,
   uint8_t const * cursorBytes = reinterpret_cast<uint8_t const *>(&cursor);
   for (size_t i = 0; i < sizeof(cursor); ++i)
     inputHash = (inputHash ^ cursorBytes[i]) * 1099511628211ull;
-  if (m_haveTextInputHash && inputHash == m_lastTextInputHash)
+  if (m_presentedFrame.matchesText(inputHash))
     return ESP_OK;
 
   renderer.renderFrame9Dot(text80Buffer, m_sourceFrame, TextSourceWidth);
@@ -355,8 +339,7 @@ esp_err_t Tab5LcdText::blitText80(tabdos::PcTextRenderer const & renderer,
   esp_err_t const err = drawOutput();
   if (err == ESP_OK) {
     ++m_drawnFrames;
-    m_lastTextInputHash = inputHash; // only skip identical inputs after a successful draw
-    m_haveTextInputHash = true;
+    m_presentedFrame.commitText(inputHash);
   }
   return err;
 }
@@ -365,14 +348,14 @@ esp_err_t Tab5LcdText::blitRgb565(uint16_t const * source, int sourceWidth, int 
 {
   ESP_RETURN_ON_FALSE(m_panel && m_frame, ESP_ERR_INVALID_STATE, TAG, "display not initialized");
   ESP_RETURN_ON_FALSE(source && sourceWidth > 0 && sourceHeight > 0, ESP_ERR_INVALID_ARG, TAG, "invalid RGB565 source");
-  uint64_t hash = 0;
-  if (frameUnchanged(source, sourceWidth, sourceHeight, &hash))
+  uint64_t const hash = hashSource(source, sourceWidth, sourceHeight);
+  if (m_presentedFrame.matchesGraphics(hash))
     return ESP_OK;
   drawFrame(source, sourceWidth, sourceHeight);
   esp_err_t const err = drawOutput();
   if (err == ESP_OK) {
     ++m_drawnFrames;
-    commitFrameHash(hash); // only skip identical frames after a successful draw
+    m_presentedFrame.commitGraphics(hash);
   }
   return err;
 }

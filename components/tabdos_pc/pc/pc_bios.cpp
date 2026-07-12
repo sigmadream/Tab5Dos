@@ -861,6 +861,19 @@ void PcBios::flushShadowKey(PcMachine & machine)
 bool PcBios::handleInterrupt(PcMachine & machine, int interruptNumber)
 {
   switch (interruptNumber) {
+    case 0x01:
+    {
+      uint16_t const vectorOffset = machine.readMemory16(0x0001 * 4 + 0);
+      uint16_t const vectorSegment = machine.readMemory16(0x0001 * 4 + 2);
+      if (vectorOffset != 0 || vectorSegment != 0)
+        return false; // deliver single-step traps to a guest-installed debugger
+      // A real BIOS provides a safe default for INT 01h. Without one, a guest
+      // that briefly sets TF during CPU detection enters the zeroed IVT and
+      // executes vector bytes as opcodes. Consume the unclaimed one-shot trap
+      // and clear TF so execution resumes without an endless trap loop.
+      PcI8086::setFlagTF(false);
+      return true;
+    }
     case 0x08:
     {
       uint16_t const vectorOffset = machine.readMemory16(0x0008 * 4 + 0);
@@ -2190,20 +2203,20 @@ bool PcBios::handleSystemInterrupt(PcMachine & machine)
     case 0x24: // A20 gate services
       switch (PcI8086::AL()) {
         case 0x00: // disable A20
-        case 0x01: // enable A20
-          // TabDOS exposes only the 1 MiB real-mode aperture, so there is no
-          // high-memory alias to switch. Report success to keep DOS memory
-          // managers on the BIOS path without advertising usable XMS/HMA.
           PcI8086::setAH(0x00);
           PcI8086::setFlagCF(false);
           return true;
+        case 0x01: // enable A20
+          PcI8086::setAH(0x86); // unsupported: no HMA backing exists
+          PcI8086::setFlagCF(true);
+          return true;
         case 0x02: // query A20 state
-          PcI8086::setAX(0x0001); // AH=success, AL=A20 enabled/no wrap
+          PcI8086::setAX(0x0000); // AH=success, AL=A20 disabled/wrapping
           PcI8086::setFlagCF(false);
           return true;
         case 0x03: // query A20 support
           PcI8086::setAH(0x00);
-          PcI8086::setBX(0x0003); // keyboard-controller and fast-A20 style paths are harmless no-ops
+          PcI8086::setBX(0x0000); // no keyboard-controller or fast-A20 gate support
           PcI8086::setFlagCF(false);
           return true;
         default:

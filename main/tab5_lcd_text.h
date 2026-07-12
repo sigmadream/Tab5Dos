@@ -1,6 +1,7 @@
 #pragma once
 
-#include "pc/pc_machine.h"
+#include "presented_frame_cache.h"
+#include "pc/pc_mouse_cursor_overlay.h"
 #include "pc/pc_text_renderer.h"
 
 #include "driver/ppa.h"
@@ -21,7 +22,7 @@ public:
   esp_err_t showStatus(char const * line1, char const * line2 = nullptr);
   esp_err_t blitText80(tabdos::PcTextRenderer const & renderer,
                        uint8_t const * text80Buffer,
-                       tabdos::PcMachine::MouseCursorOverlay const & cursor = {});
+                       tabdos::MouseCursorOverlay const & cursor = {});
   esp_err_t blitRgb565(uint16_t const * source, int sourceWidth, int sourceHeight);
 
   // Composite the INT 33h pointer onto an RGB565 source frame in place, before
@@ -29,7 +30,7 @@ public:
   static void applyMouseCursor(uint16_t * buffer,
                                int width,
                                int height,
-                               tabdos::PcMachine::MouseCursorOverlay const & cursor);
+                               tabdos::MouseCursorOverlay const & cursor);
 
   // Count of frames actually rotated and pushed to the panel (skipped identical
   // frames are not counted). Used by the display task to report effective fps.
@@ -66,12 +67,6 @@ private:
   esp_err_t drawOutput();
   void drawFrame(uint16_t const * source, int sourceWidth, int sourceHeight);
   static uint64_t hashSource(uint16_t const * source, int width, int height);
-  // Returns true when `source` matches the last successfully presented frame.
-  // Writes the freshly computed hash to *hashOut; the caller commits it via
-  // commitFrameHash only after the panel draw succeeds, so a failed draw is
-  // retried on the next cycle instead of being skipped forever.
-  bool frameUnchanged(uint16_t const * source, int width, int height, uint64_t * hashOut);
-  void commitFrameHash(uint64_t hash);
   static void rotateScaleCounterClockwise(uint16_t const * source,
                                           int sourceWidth,
                                           int sourceHeight,
@@ -83,10 +78,7 @@ private:
   uint16_t * m_sourceFrame = nullptr;
   uint16_t * m_frame = nullptr;
   uint8_t * m_statusText = nullptr;
-  uint64_t m_lastFrameHash = 0;
-  bool m_haveFrameHash = false;
-  uint64_t m_lastTextInputHash = 0; // text-mode input-based dirty detection
-  bool m_haveTextInputHash = false;
+  PresentedFrameCache m_presentedFrame;
   uint32_t m_drawnFrames = 0;
   int m_lastRotSourceW = -1; // last source size, to know when to reclear output margins
   int m_lastRotSourceH = -1;

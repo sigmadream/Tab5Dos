@@ -4,6 +4,7 @@
 #include "pc_bios.h"
 #include "pc_i8086.h"
 #include "pc_keyboard_controller.h"
+#include "pc_mouse_cursor_overlay.h"
 #include "pc_opl2.h"
 #include "pc_text_renderer.h"
 
@@ -43,6 +44,8 @@ public:
     uint64_t unsupportedPortWriteCount;
     uint8_t lastUnsupportedInterrupt;
     uint8_t lastUnsupportedInterruptAh;
+    uint16_t lastUnsupportedInterruptCs;
+    uint16_t lastUnsupportedInterruptIp;
     uint16_t lastUnsupportedPortRead;
     uint16_t lastUnsupportedPortWrite;
     uint64_t diskWriteCount;
@@ -75,20 +78,6 @@ public:
 
   struct VgaLatchState {
     uint8_t plane[4];
-  };
-
-  // Resolved mouse pointer overlay in source-frame pixel coordinates, produced
-  // for the display layer so the INT 33h cursor can be composited on top of the
-  // rendered frame without the emulator core touching the display buffers.
-  struct MouseCursorOverlay {
-    bool visible = false;
-    bool textCell = false; // true: invert a text cell rect; false: draw the 16x16 mask
-    int x = 0;
-    int y = 0;
-    int cellWidth = 0;
-    int cellHeight = 0;
-    uint16_t screenMask[16] = {};
-    uint16_t cursorMask[16] = {};
   };
 
   enum class VideoMode {
@@ -128,9 +117,10 @@ public:
   static constexpr uint32_t DefaultBootLinearAddress = 0x00007c00;
   static constexpr int DiskCount = 4;
 
-  // LIM EMS 3.2 expanded memory: a 64 KiB page frame of four 16 KiB physical
-  // pages, backed by a PSRAM pool that DOS programs map in via INT 67h.
+  // LIM EMS 4.0 expanded memory subset: a 64 KiB page frame of four 16 KiB
+  // physical pages, backed by a PSRAM pool that DOS programs map via INT 67h.
   static constexpr uint16_t EmsPageFrameSegment = 0xe000;
+  static constexpr uint8_t EmsVersion = 0x40;
   static constexpr int EmsPhysicalPages = 4;
   static constexpr int EmsLogicalPageSize = 16 * 1024;
   static constexpr int EmsTotalPages = 256; // 4 MiB pool
@@ -199,10 +189,10 @@ public:
   // under the machine mutex (snapshotOpl2), then synthesizes without the mutex
   // held (synthesizeOpl2) so FM rendering never stalls the emulated CPU.
   // synthesizeOpl2 returns false when no voice is sounding.
-  void snapshotOpl2(uint8_t out[256]) const { m_opl2.snapshotRegisters(out); }
-  bool synthesizeOpl2(uint8_t const * regs, int16_t * out, int frames, uint32_t sampleRate)
+  void snapshotOpl2(Opl2::RegisterSnapshot * out) const { m_opl2.snapshotRegisters(out); }
+  bool synthesizeOpl2(Opl2::RegisterSnapshot const & snapshot, int16_t * out, int frames, uint32_t sampleRate)
   {
-    return m_opl2.render(regs, out, frames, sampleRate);
+    return m_opl2.render(snapshot, out, frames, sampleRate);
   }
 
   bool emsAvailable() const { return m_emsPool != nullptr; }

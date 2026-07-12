@@ -12,8 +12,15 @@ namespace tabdos {
 // voices (feedback, FM/AM connection, ADSR envelopes, the four OPL2 waveforms).
 class Opl2 {
 public:
+  struct RegisterSnapshot {
+    uint8_t registers[256];
+    uint32_t resetGeneration;
+  };
+
   Opl2();
 
+  // Reset front-end registers immediately. The audio-owned synthesis state is
+  // cleared when the next snapshot generation reaches render().
   void reset();
 
   // ---- Front-end: touched by the emulated CPU under the machine mutex. ----
@@ -26,7 +33,7 @@ public:
   uint8_t readStatus(uint64_t nowMicros);
   // Copy the register file for the audio thread to synthesize from without
   // holding the machine mutex during the (expensive) FM render.
-  void snapshotRegisters(uint8_t out[256]) const;
+  void snapshotRegisters(RegisterSnapshot * out) const;
 
   // ---- Back-end: touched only by the audio thread (no mutex). ----
   // Synthesize `frames` mono int16 samples at `sampleRate` from a register
@@ -34,7 +41,7 @@ public:
   // comparing the snapshot's B0-B8 registers against the previous chunk, so no
   // register write path mutates the DSP state. Returns false (buffer untouched)
   // when no operator is audible, so the host can idle.
-  bool render(uint8_t const * regs, int16_t * out, int frames, uint32_t sampleRate);
+  bool render(RegisterSnapshot const & snapshot, int16_t * out, int frames, uint32_t sampleRate);
 
   bool anyKeyOn() const;
 
@@ -56,6 +63,7 @@ private:
   void writeRegister(uint8_t reg, uint8_t value, uint64_t nowMicros);
   void advanceTimers(uint64_t nowMicros);
   void keyOnChannel(int channel, bool on);
+  void resetSynthesisState();
 
   static float waveform(uint8_t select, float phase);
   static float attackStep(uint8_t rate, uint32_t sampleRate);
@@ -64,8 +72,10 @@ private:
   uint8_t m_registers[256];
   uint8_t m_address;
   uint8_t m_status;
+  uint32_t m_resetGeneration;
   Operator m_operators[OperatorSlots];
   bool m_channelKeyOn[Channels];
+  uint32_t m_renderGeneration;
 
   bool m_timer1Running;
   bool m_timer2Running;
