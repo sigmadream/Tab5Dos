@@ -45,13 +45,25 @@ uint64_t PcTextRenderer::stateHash() const
 {
   uint64_t h = 1469598103934665603ull;
   auto fold = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
-  fold(reinterpret_cast<uintptr_t>(m_font.data));
   fold(m_font.glyphCount);
-  fold(reinterpret_cast<uintptr_t>(m_vgaFontPlane));
+  if (m_font.data) {
+    size_t const renderedGlyphs = m_font.glyphCount < 256 ? m_font.glyphCount : 256;
+    for (size_t i = 0; i < renderedGlyphs * CellHeight; ++i)
+      fold(m_font.data[i]);
+  }
   fold(m_vgaCharacterMapClear);
   fold(m_vgaCharacterMapSet);
   fold(m_underlineLocation);
   fold(m_vgaFontSelectionEnabled);
+  if (m_vgaFontSelectionEnabled) {
+    uint8_t const maps[2] = {m_vgaCharacterMapClear, m_vgaCharacterMapSet};
+    for (uint8_t map : maps) {
+      uint32_t const base = characterMapOffset(map);
+      for (uint32_t character = 0; character < 256; ++character)
+        for (uint32_t row = 0; row < 32; ++row)
+          fold(m_vgaFontPlane[(base + character * 32u + row) & 0xffff]);
+    }
+  }
   fold(static_cast<uint64_t>(m_columns));
   fold(static_cast<uint64_t>(m_cellHeight));
   fold(static_cast<uint64_t>(m_rows));

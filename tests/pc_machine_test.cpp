@@ -6947,6 +6947,50 @@ int main()
   machine.stepCpu();
   assert(PcI8086::AL() == 0x7f && !PcI8086::flagCF() && PcI8086::flagOF());
 
+  // INT 13h must transfer through the mapped EMS page frame rather than the
+  // hidden flat-RAM bytes at the same physical address.
+  machine.reset();
+  uint8_t const int13ToEmsProgram[] = {
+    0xbb, 0x01, 0x00,       // mov bx, 1: allocate one EMS page
+    0xb4, 0x43,             // mov ah, 43h
+    0xcd, 0x67,             // int 67h
+    0x52,                   // push dx: save EMS handle
+    0xbb, 0x00, 0x00,       // mov bx, 0: logical page 0
+    0xb8, 0x00, 0x44,       // mov ax, 4400h: map physical slot 0
+    0x5a,                   // pop dx: restore EMS handle
+    0xcd, 0x67,             // int 67h
+    0xb8, 0x00, 0xe0,       // mov ax, e000h
+    0x8e, 0xc0,             // mov es, ax
+    0x31, 0xdb,             // xor bx, bx: destination E000:0000
+    0xb4, 0x02,             // mov ah, 02h: BIOS read sectors
+    0xb0, 0x01,             // mov al, 1 sector
+    0xb5, 0x00,             // mov ch, cylinder 0
+    0xb1, 0x02,             // mov cl, sector 2
+    0xb6, 0x00,             // mov dh, head 0
+    0xb2, 0x00,             // mov dl, drive A
+    0xcd, 0x13,             // int 13h
+    0xf4                    // hlt
+  };
+  memset(sector, 0, sizeof(sector));
+  memcpy(sector, int13ToEmsProgram, sizeof(int13ToEmsProgram));
+  sector[510] = 0x55;
+  sector[511] = 0xaa;
+  assert(machine.disk(0)->writeSectors(0, 1, sector));
+  uint8_t emsDiskPayload[PcDiskImage::SectorSize];
+  for (size_t i = 0; i < sizeof(emsDiskPayload); ++i)
+    emsDiskPayload[i] = static_cast<uint8_t>(i ^ 0xa5);
+  assert(machine.disk(0)->writeSectors(1, 1, emsDiskPayload));
+  assert(machine.loadBootSector(0, 0x00));
+  assert(machine.prepareBootCpu());
+  machine.runCpuSteps(64);
+  assert(machine.cpuHalted());
+  uint8_t emsReadback[PcDiskImage::SectorSize] = {};
+  assert(machine.readMemoryBlock(static_cast<uint32_t>(PcMachine::EmsPageFrameSegment) << 4,
+                                 emsReadback,
+                                 sizeof(emsReadback)));
+  assert(memcmp(emsReadback, emsDiskPayload, sizeof(emsReadback)) == 0);
+  assert(machine.ram()[static_cast<uint32_t>(PcMachine::EmsPageFrameSegment) << 4] == 0x00);
+
   memset(sector, 0, sizeof(sector));
   memcpy(sector, "MACHINE", 7);
   assert(machine.disk(0)->writeChs(0, 0, 1, 1, sector));

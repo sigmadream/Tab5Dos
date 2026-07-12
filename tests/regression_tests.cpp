@@ -3,9 +3,16 @@
 #include <cstdint>
 #include <cstdio>
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
 #define private public
 #include "pc_i8086.h"
 #undef private
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 #include "pc_machine.h"
 #include "pc_opl2.h"
 #include "presented_frame_cache.h"
@@ -99,6 +106,51 @@ bool testUnalignedRamWordAccess()
   tabdos::PcI8086::step();
   ok &= expect(tabdos::PcI8086::halted(),
                "instruction fetch above 1 MiB must wrap to the 8086 20-bit physical address");
+  return ok;
+}
+
+bool testInstructionFetchAndStackUseMappedMemory()
+{
+  std::array<uint8_t, 1024 * 1024> memory{};
+  EmsFixture ems;
+  tabdos::PcI8086::setCallbacks(&ems, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  tabdos::PcI8086::setMemory(memory.data());
+  tabdos::PcI8086::setEmsWindow(EmsBase, EmsEnd, readEms, writeEms);
+
+  memory[0x0fffff] = 0xb8; // MOV AX, 1234h, wrapping across the 20-bit bus boundary.
+  memory[0x000000] = 0x34;
+  memory[0x000001] = 0x12;
+  tabdos::PcI8086::setEmsWindowActive(false);
+  tabdos::PcI8086::reset();
+  tabdos::PcI8086::setCS(0xffff);
+  tabdos::PcI8086::setIP(0x000f);
+  tabdos::PcI8086::step();
+  bool ok = expect(tabdos::PcI8086::AX() == 0x1234,
+                   "multi-byte instruction fetch must wrap at the 20-bit address boundary");
+
+  memory[EmsBase] = 0xf4; // Flat RAM must be hidden while the EMS frame is mapped.
+  ems.bytes[0] = 0xb8;    // MOV AX, 5678h from mapped expanded memory.
+  ems.bytes[1] = 0x78;
+  ems.bytes[2] = 0x56;
+  tabdos::PcI8086::setEmsWindowActive(true);
+  tabdos::PcI8086::reset();
+  tabdos::PcI8086::setCS(0xe000);
+  tabdos::PcI8086::setIP(0x0000);
+  tabdos::PcI8086::step();
+  ok &= expect(!tabdos::PcI8086::halted() && tabdos::PcI8086::AX() == 0x5678,
+               "instruction fetch must execute bytes from the mapped EMS page frame");
+
+  memory[0x0100] = 0x50; // PUSH AX
+  tabdos::PcI8086::setCS(0x0000);
+  tabdos::PcI8086::setIP(0x0100);
+  tabdos::PcI8086::setSS(0xe000);
+  tabdos::PcI8086::setSP(0x0002);
+  tabdos::PcI8086::setAX(0xabcd);
+  tabdos::PcI8086::step();
+  ok &= expect(ems.bytes[0] == 0xcd && ems.bytes[1] == 0xab,
+               "stack writes in the EMS page frame must use mapped expanded memory");
+
+  tabdos::PcI8086::setEmsWindowActive(false);
   return ok;
 }
 
@@ -221,13 +273,75 @@ bool testEmsMappablePhysicalAddressArray()
   return ok;
 }
 
+bool testMachineMemoryApisUseMappedEms()
+{
+  tabdos::PcMachine machine;
+  bool ok = expect(machine.init(), "machine initialization must provide the EMS pool for host tests");
+  if (!ok)
+    return false;
+
+  tabdos::PcI8086::setBX(2);
+  tabdos::PcI8086::setAX(0x4300);
+  ok &= expect(machine.handleEmsInterrupt() && tabdos::PcI8086::AH() == 0x00,
+               "EMS allocation must succeed before testing mapped machine memory");
+  uint16_t const handle = tabdos::PcI8086::DX();
+  for (uint8_t physicalPage = 0; physicalPage < 2; ++physicalPage) {
+    tabdos::PcI8086::setAL(physicalPage);
+    tabdos::PcI8086::setBX(physicalPage);
+    tabdos::PcI8086::setDX(handle);
+    tabdos::PcI8086::setAH(0x44);
+    ok &= expect(machine.handleEmsInterrupt() && tabdos::PcI8086::AH() == 0x00,
+                 "EMS logical pages must map into adjacent physical slots");
+  }
+
+  constexpr uint32_t Boundary = EmsBase + EmsPageSize;
+  machine.ram()[Boundary - 1] = 0x11;
+  machine.ram()[Boundary] = 0x22;
+  std::array<uint8_t, 4> const source = {0xa1, 0xb2, 0xc3, 0xd4};
+  std::array<uint8_t, 4> dest{};
+  ok &= expect(machine.writeMemoryBlock(Boundary - 2, source.data(), source.size()),
+               "machine block writes must accept ranges crossing mapped EMS pages");
+  ok &= expect(machine.readMemoryBlock(Boundary - 2, dest.data(), dest.size()) && dest == source,
+               "machine block reads must resolve both mapped EMS pages");
+  ok &= expect(machine.ram()[Boundary - 1] == 0x11 && machine.ram()[Boundary] == 0x22,
+               "mapped machine memory APIs must not write the hidden flat RAM backing");
+  return ok;
+}
+
+bool testCpuAttachmentLifecycle()
+{
+  EmsFixture owner;
+  tabdos::PcI8086::setCallbacks(&owner, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  tabdos::PcI8086::setEmsWindowActive(true);
+
+  bool ok = true;
+  {
+    tabdos::PcMachine unrelated;
+    ok &= expect(unrelated.init(), "unrelated machine must initialize for attachment isolation test");
+    ok &= expect(tabdos::PcI8086::isAttachedTo(&owner) && tabdos::PcI8086::s_emsActive,
+                 "resetting another machine must not replace or mutate the active CPU attachment");
+    ok &= expect(unrelated.runCpuSteps(1) == 0 && unrelated.cpuHalted(),
+                 "an unattached machine must not execute another machine's CPU state");
+  }
+
+  auto * attached = new tabdos::PcMachine();
+  tabdos::PcI8086::setCallbacks(attached, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+  ok &= expect(tabdos::PcI8086::isAttachedTo(attached), "test machine must own the CPU attachment");
+  delete attached;
+  ok &= expect(!tabdos::PcI8086::isAttachedTo(attached),
+               "destroying the active machine must detach global CPU callbacks");
+  return ok;
+}
+
 } // namespace
 
 int main()
 {
   bool const ok = testEmsWordBoundaries() && testUnalignedRamWordAccess() &&
+                  testInstructionFetchAndStackUseMappedMemory() &&
                   testOplZeroAttackAndResetHandoff() &&
-                  testPresentationPathTransitions() && testEmsMappablePhysicalAddressArray();
+                  testPresentationPathTransitions() && testEmsMappablePhysicalAddressArray() &&
+                  testMachineMemoryApisUseMappedEms() && testCpuAttachmentLifecycle();
   if (ok)
     std::puts("All regression tests passed");
   return ok ? 0 : 1;

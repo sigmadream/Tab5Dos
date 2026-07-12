@@ -129,47 +129,9 @@ static bool isRegsAddress(int addr, int size)
   return addr >= regs_offset && addr + size <= regs_offset + static_cast<int>(sizeof(regs));
 }
 
-static uint8_t & rawMem8(uint8_t * memory, int addr)
-{
-  if (isRegsAddress(addr, 1))
-    return regs[addr - regs_offset];
-  return memory[addr & PhysicalAddressMask];
-}
-
-class UnalignedWord
-{
-public:
-  UnalignedWord(uint8_t * low, uint8_t * high) : m_low(low), m_high(high) {}
-  UnalignedWord & operator=(UnalignedWord const &) = delete;
-
-  operator uint16_t() const
-  {
-    return static_cast<uint16_t>(*m_low | (static_cast<uint16_t>(*m_high) << 8));
-  }
-
-  UnalignedWord & operator=(uint16_t value)
-  {
-    *m_low = static_cast<uint8_t>(value);
-    *m_high = static_cast<uint8_t>(value >> 8);
-    return *this;
-  }
-
-private:
-  uint8_t * m_low;
-  uint8_t * m_high;
-};
-
 static uint16_t readUnalignedWord(uint8_t const * bytes)
 {
   return static_cast<uint16_t>(bytes[0] | (static_cast<uint16_t>(bytes[1]) << 8));
-}
-
-static UnalignedWord rawMem16(uint8_t * memory, int addr)
-{
-  if (isRegsAddress(addr, 2))
-    return UnalignedWord(regs + (addr - regs_offset), regs + (addr - regs_offset) + 1);
-  return UnalignedWord(memory + (addr & PhysicalAddressMask),
-                       memory + ((addr + 1) & PhysicalAddressMask));
 }
 
 
@@ -199,6 +161,27 @@ uint32_t                  PcI8086::s_emsBase = 0;
 uint32_t                  PcI8086::s_emsEnd = 0;
 PcI8086::ReadPort         PcI8086::s_emsRead = nullptr;
 PcI8086::WritePort        PcI8086::s_emsWrite = nullptr;
+
+void PcI8086::detach(void const * context)
+{
+  if (s_context != context)
+    return;
+  s_context = nullptr;
+  s_readPort = nullptr;
+  s_writePort = nullptr;
+  s_writeVideoMemory8 = nullptr;
+  s_writeVideoMemory16 = nullptr;
+  s_readVideoMemory8 = nullptr;
+  s_readVideoMemory16 = nullptr;
+  s_interrupt = nullptr;
+  s_memory = nullptr;
+  s_emsActive = false;
+  s_emsBase = 0;
+  s_emsEnd = 0;
+  s_emsRead = nullptr;
+  s_emsWrite = nullptr;
+  s_unsupportedOpcode = nullptr;
+}
 
 
 
@@ -735,9 +718,10 @@ void PcI8086::triggerInterrupt(uint8_t interrupt_num)
 /////////////////////////////////////////////////////////////////////////////
 
 
-// direct RAM/register-window access (not video RAM)
-#define MEM8(addr)  rawMem8(s_memory, addr)
-#define MEM16(addr) rawMem16(s_memory, addr)
+// Compatibility aliases for the decoder's legacy stack/vector sites. Both now
+// resolve through the same physical-memory path as ordinary operands.
+#define MEM8(addr)  RMEM8(addr)
+#define MEM16(addr) memoryWord(addr)
 
 
 uint8_t PcI8086::RMEM8(int addr)
@@ -777,9 +761,8 @@ uint16_t PcI8086::RMEM16(int addr)
     // half through its own current mapping.
     return static_cast<uint16_t>(s_emsRead(s_context, addr) | (s_emsRead(s_context, addr + 1) << 8));
   } else {
-    return addr == PhysicalAddressMask
-               ? static_cast<uint16_t>(rawMem16(s_memory, addr))
-               : readUnalignedWord(s_memory + addr);
+    return static_cast<uint16_t>(s_memory[addr] |
+                                 (static_cast<uint16_t>(s_memory[(addr + 1) & PhysicalAddressMask]) << 8));
   }
 }
 
@@ -826,12 +809,8 @@ uint16_t PcI8086::WMEM16(int addr, uint16_t value)
     s_emsWrite(s_context, addr, static_cast<uint8_t>(value & 0xff));
     s_emsWrite(s_context, addr + 1, static_cast<uint8_t>(value >> 8));
   } else {
-    if (addr == PhysicalAddressMask) {
-      rawMem16(s_memory, addr) = value;
-    } else {
-      s_memory[addr] = static_cast<uint8_t>(value);
-      s_memory[addr + 1] = static_cast<uint8_t>(value >> 8);
-    }
+    s_memory[addr] = static_cast<uint8_t>(value);
+    s_memory[(addr + 1) & PhysicalAddressMask] = static_cast<uint8_t>(value >> 8);
   }
   return value;
 }
@@ -1061,7 +1040,22 @@ void PcI8086::step()
       --rep_override_en;
 
     uint32_t const instructionLinear = (16u * regs16[REG_CS] + reg_ip) & PhysicalAddressMask;
+    static constexpr uint32_t InstructionBytesNeeded = 6;
+    uint8_t fetchedInstruction[InstructionBytesNeeded];
+    bool const crossesAddressWrap = instructionLinear >
+                                    static_cast<uint32_t>(PhysicalAddressMask) - (InstructionBytesNeeded - 1);
+    bool const overlapsVideo = !crossesAddressWrap &&
+                               instructionLinear < VIDEOMEM_END &&
+                               instructionLinear + InstructionBytesNeeded > VIDEOMEM_START;
+    bool const overlapsEms = !crossesAddressWrap && s_emsActive &&
+                             instructionLinear < s_emsEnd &&
+                             instructionLinear + InstructionBytesNeeded > s_emsBase;
     uint8_t const * opcode_stream = s_memory + instructionLinear;
+    if (crossesAddressWrap || overlapsVideo || overlapsEms) {
+      for (uint32_t i = 0; i < InstructionBytesNeeded; ++i)
+        fetchedInstruction[i] = RMEM8(static_cast<int>(instructionLinear + i));
+      opcode_stream = fetchedInstruction;
+    }
 
     // 80386 operand/address-size prefixes. TabDOS remains a 16-bit emulator,
     // but DOS runtimes can emit these harmlessly before byte-sized or

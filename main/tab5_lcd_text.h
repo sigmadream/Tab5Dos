@@ -8,6 +8,7 @@
 #include "esp_err.h"
 #include "esp_lcd_panel_ops.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 class Tab5LcdText {
@@ -36,12 +37,13 @@ public:
   // frames are not counted). Used by the display task to report effective fps.
   uint32_t drawnFrameCount() const { return m_drawnFrames; }
 
-  // Dump the last presented PC source frame (before the rotate/scale to the
-  // portrait panel) to the serial console as base64. Each data line is prefixed
-  // with "SS:" and wrapped by BEGIN/END markers so a host tool can extract the
-  // RGB565 pixels even if other tasks interleave log lines. Call from the display
-  // task only, so the source buffer is not being rewritten concurrently.
-  esp_err_t dumpSourceFrameBase64() const;
+  static constexpr size_t ScreenshotMaxPixels = 640 * 480;
+
+  // Copy the last source frame while called from the display-owner task. The
+  // returned snapshot can then be encoded by another task without blocking
+  // presentation or racing the next frame.
+  esp_err_t copySourceFrame(uint16_t * dest, size_t capacityPixels, int * width, int * height) const;
+  static esp_err_t dumpRgb565Base64(uint16_t const * source, int width, int height);
 
 private:
   static constexpr int LcdWidth = 720;

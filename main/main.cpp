@@ -201,9 +201,14 @@ struct AppState {
   bool syntheticKeyActive = false;
   TickType_t syntheticKeyReleaseAt = 0;
   TickType_t syntheticKeyNextPressAt = 0;
-  // Set by the touch task on a corner long-press; the display task services it
-  // by dumping the current PC frame over serial, then clears it.
+  // Screenshot ownership handshake: touch requests, display copies a stable
+  // source frame, and a low-priority task performs slow encoding/serial output.
   std::atomic_bool screenshotRequested{false};
+  std::atomic_bool screenshotReady{false};
+  std::atomic_bool screenshotBusy{false};
+  uint16_t * screenshotFrame = nullptr;
+  int screenshotWidth = 0;
+  int screenshotHeight = 0;
 };
 
 struct BootDiskSelection {
@@ -909,12 +914,19 @@ static void displayTask(void * arg)
     if (drew)
       blitUsAccum += static_cast<uint32_t>(esp_timer_get_time() - blitStart);
 
-    // Service a pending screenshot from the same task that owns the source
-    // buffers, so the frame is not rewritten mid-dump.
+    // Copy a stable frame in the owner task, then let the low-priority
+    // screenshot task encode and serialize it without stalling presentation.
     if (app->screenshotRequested.exchange(false, std::memory_order_acq_rel)) {
-      esp_err_t const shotErr = app->display.dumpSourceFrameBase64();
-      if (shotErr != ESP_OK)
+      esp_err_t const shotErr = app->display.copySourceFrame(app->screenshotFrame,
+                                                             Tab5LcdText::ScreenshotMaxPixels,
+                                                             &app->screenshotWidth,
+                                                             &app->screenshotHeight);
+      if (shotErr == ESP_OK) {
+        app->screenshotReady.store(true, std::memory_order_release);
+      } else {
         ESP_LOGW(TAG, "screenshot dump skipped: %s", esp_err_to_name(shotErr));
+        app->screenshotBusy.store(false, std::memory_order_release);
+      }
     }
 
     TickType_t const nowTick = xTaskGetTickCount();
@@ -932,6 +944,23 @@ static void displayTask(void * arg)
     }
     // Keep up with a changing screen; back off when it is static.
     vTaskDelay(drew ? DisplayActiveDelay : DisplayIdleDelay);
+  }
+}
+
+static void screenshotTask(void * arg)
+{
+  auto * app = static_cast<AppState *>(arg);
+  while (true) {
+    if (!app->screenshotReady.exchange(false, std::memory_order_acq_rel)) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    esp_err_t const err = Tab5LcdText::dumpRgb565Base64(app->screenshotFrame,
+                                                        app->screenshotWidth,
+                                                        app->screenshotHeight);
+    if (err != ESP_OK)
+      ESP_LOGW(TAG, "screenshot dump failed: %s", esp_err_to_name(err));
+    app->screenshotBusy.store(false, std::memory_order_release);
   }
 }
 
@@ -969,9 +998,15 @@ static void touchMouseTask(void * arg)
         screenshotFired = false;
         screenshotPressStart = nowTick;
       } else if (!screenshotFired && (nowTick - screenshotPressStart) >= ScreenshotHoldDelay) {
-        app->screenshotRequested.store(true, std::memory_order_release);
+        bool expected = false;
+        if (app->screenshotFrame &&
+            app->screenshotBusy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+          app->screenshotRequested.store(true, std::memory_order_release);
+          ESP_LOGI(TAG, "screenshot requested via corner long-press");
+        } else {
+          ESP_LOGW(TAG, "screenshot request skipped: capture unavailable or busy");
+        }
         screenshotFired = true;
-        ESP_LOGI(TAG, "screenshot requested via corner long-press");
       }
     } else {
       screenshotArmed = false;
@@ -1205,8 +1240,25 @@ extern "C" void app_main(void)
     s_app.runtimeLog.line("PC speaker audio unavailable");
   }
 
+  s_app.screenshotFrame = static_cast<uint16_t *>(heap_caps_malloc(
+      Tab5LcdText::ScreenshotMaxPixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!s_app.screenshotFrame)
+    s_app.screenshotFrame = static_cast<uint16_t *>(heap_caps_malloc(
+        Tab5LcdText::ScreenshotMaxPixels * sizeof(uint16_t), MALLOC_CAP_8BIT));
+  if (!s_app.screenshotFrame) {
+    ESP_LOGW(TAG, "screenshot snapshot allocation failed; capture disabled");
+    s_app.runtimeLog.line("screenshot snapshot allocation failed; capture disabled");
+  }
+
   xTaskCreatePinnedToCore(cpuTask, "pc_cpu", 8192, &s_app, 6, nullptr, 1);
   xTaskCreatePinnedToCore(displayTask, "pc_lcd", 4096, &s_app, 4, nullptr, 0);
+  if (s_app.screenshotFrame &&
+      xTaskCreatePinnedToCore(screenshotTask, "pc_screenshot", 4096, &s_app, 2, nullptr, 0) != pdPASS) {
+    heap_caps_free(s_app.screenshotFrame);
+    s_app.screenshotFrame = nullptr;
+    ESP_LOGW(TAG, "screenshot task creation failed; capture disabled");
+    s_app.runtimeLog.line("screenshot task creation failed; capture disabled");
+  }
   if (s_app.touch)
     xTaskCreatePinnedToCore(touchMouseTask, "pc_touch_mouse", 4096, &s_app, 3, nullptr, 0);
   if (s_app.speaker.ready())

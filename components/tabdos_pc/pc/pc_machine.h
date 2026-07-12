@@ -237,6 +237,7 @@ private:
   void emsMapPage(int physPage, int handle, int logicalPage);
   int emsFreePageCount() const;
   int emsActiveHandleCount() const;
+  bool emsWindowActive() const;
   void updateEmsWindowActive();
   static uint8_t emsReadCallback(void * context, int address);
   static void emsWriteCallback(void * context, int address, uint8_t value);

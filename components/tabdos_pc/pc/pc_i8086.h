@@ -44,6 +44,8 @@ public:
   }
 
   static void setMemory(uint8_t * memory) { s_memory = memory; }
+  static bool isAttachedTo(void const * context) { return s_context == context; }
+  static void detach(void const * context);
 
   // Redirect a byte-addressed window (used for the EMS page frame) to callbacks
   // instead of flat RAM, so mapped expanded-memory pages resolve to their pool
@@ -151,6 +153,23 @@ private:
   static uint16_t WMEM16(int addr, uint16_t value);
   static uint8_t RMEM8(int addr);
   static uint16_t RMEM16(int addr);
+
+  class MemoryWord {
+  public:
+    explicit MemoryWord(int address) : m_address(address) {}
+    MemoryWord & operator=(uint16_t value)
+    {
+      PcI8086::WMEM16(m_address, value);
+      return *this;
+    }
+    MemoryWord & operator=(MemoryWord const &) = delete;
+    operator uint16_t() const { return PcI8086::RMEM16(m_address); }
+
+  private:
+    int m_address;
+  };
+
+  static MemoryWord memoryWord(int addr) { return MemoryWord(addr); }
 
   static uint16_t make_flags();
   static void set_flags(int new_flags);

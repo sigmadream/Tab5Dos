@@ -329,6 +329,7 @@ PcMachine::PcMachine()
 
 PcMachine::~PcMachine()
 {
+  PcI8086::detach(this);
   freeMachineMemory(m_ram);
   freeMachineMemory(m_videoMemory);
   freeMachineMemory(m_vgaPlaneMemory);
@@ -1044,6 +1045,8 @@ uint32_t PcMachine::speakerFrequency() const
 
 void PcMachine::stepCpu()
 {
+  if (!PcI8086::isAttachedTo(this))
+    return;
   if (--m_timerUpdateCountdown <= 0) {
     serviceTimerInterrupt();
     m_timerUpdateCountdown = 1024;
@@ -1079,7 +1082,7 @@ int PcMachine::runCpuSteps(int maxSteps)
 
 bool PcMachine::cpuHalted() const
 {
-  return PcI8086::halted();
+  return !PcI8086::isAttachedTo(this) || PcI8086::halted();
 }
 
 void PcMachine::completeKeyboardIrqService()
@@ -1173,7 +1176,11 @@ void PcMachine::setMouseSourceState(uint16_t x, uint16_t y, uint16_t width, uint
 
 PcMachine::CpuState PcMachine::cpuState() const
 {
-  CpuState state;
+  CpuState state{};
+  if (!PcI8086::isAttachedTo(this)) {
+    state.halted = true;
+    return state;
+  }
   state.ax = PcI8086::AX();
   state.bx = PcI8086::BX();
   state.cx = PcI8086::CX();
@@ -1570,6 +1577,10 @@ uint8_t PcMachine::readMemory8(uint32_t address) const
 {
   if (!m_ram || !isRangeValid(address, 1, RamSize))
     return 0xff;
+  uint32_t const emsBase = static_cast<uint32_t>(EmsPageFrameSegment) << 4;
+  uint32_t const emsEnd = emsBase + static_cast<uint32_t>(EmsPhysicalPages) * EmsLogicalPageSize;
+  if (emsWindowActive() && address >= emsBase && address < emsEnd)
+    return emsReadCallback(const_cast<PcMachine *>(this), static_cast<int>(address));
   return m_ram[address];
 }
 
@@ -1584,6 +1595,12 @@ void PcMachine::writeMemory8(uint32_t address, uint8_t value)
 {
   if (!m_ram || !isRangeValid(address, 1, RamSize))
     return;
+  uint32_t const emsBase = static_cast<uint32_t>(EmsPageFrameSegment) << 4;
+  uint32_t const emsEnd = emsBase + static_cast<uint32_t>(EmsPhysicalPages) * EmsLogicalPageSize;
+  if (emsWindowActive() && address >= emsBase && address < emsEnd) {
+    emsWriteCallback(this, static_cast<int>(address), value);
+    return;
+  }
   m_ram[address] = value;
 }
 
@@ -1602,7 +1619,17 @@ bool PcMachine::readMemoryBlock(uint32_t address, void * dest, size_t size) cons
 {
   if (!dest || !isRamRangeValid(address, size))
     return false;
-  memcpy(dest, m_ram + address, size);
+  uint32_t const emsBase = static_cast<uint32_t>(EmsPageFrameSegment) << 4;
+  uint32_t const emsEnd = emsBase + static_cast<uint32_t>(EmsPhysicalPages) * EmsLogicalPageSize;
+  bool const overlapsMappedEms = emsWindowActive() && address < emsEnd &&
+                                 static_cast<uint64_t>(address) + size > emsBase;
+  if (!overlapsMappedEms) {
+    memcpy(dest, m_ram + address, size);
+    return true;
+  }
+  uint8_t * bytes = static_cast<uint8_t *>(dest);
+  for (size_t i = 0; i < size; ++i)
+    bytes[i] = readMemory8(address + static_cast<uint32_t>(i));
   return true;
 }
 
@@ -1610,7 +1637,17 @@ bool PcMachine::writeMemoryBlock(uint32_t address, void const * src, size_t size
 {
   if (!src || !isRamRangeValid(address, size))
     return false;
-  memcpy(m_ram + address, src, size);
+  uint32_t const emsBase = static_cast<uint32_t>(EmsPageFrameSegment) << 4;
+  uint32_t const emsEnd = emsBase + static_cast<uint32_t>(EmsPhysicalPages) * EmsLogicalPageSize;
+  bool const overlapsMappedEms = emsWindowActive() && address < emsEnd &&
+                                 static_cast<uint64_t>(address) + size > emsBase;
+  if (!overlapsMappedEms) {
+    memcpy(m_ram + address, src, size);
+    return true;
+  }
+  uint8_t const * bytes = static_cast<uint8_t const *>(src);
+  for (size_t i = 0; i < size; ++i)
+    writeMemory8(address + static_cast<uint32_t>(i), bytes[i]);
   return true;
 }
 
@@ -3201,14 +3238,16 @@ void PcMachine::updateEmsWindowActive()
 {
   // The CPU only pays the page-frame redirect cost while at least one physical
   // page is mapped; otherwise E000:0 falls through to flat RAM.
-  bool active = false;
-  for (int p = 0; p < EmsPhysicalPages; ++p) {
-    if (m_emsPhysMapPoolPage[p] >= 0) {
-      active = true;
-      break;
-    }
-  }
-  PcI8086::setEmsWindowActive(active);
+  if (PcI8086::isAttachedTo(this))
+    PcI8086::setEmsWindowActive(emsWindowActive());
+}
+
+bool PcMachine::emsWindowActive() const
+{
+  for (int p = 0; p < EmsPhysicalPages; ++p)
+    if (m_emsPhysMapPoolPage[p] >= 0)
+      return true;
+  return false;
 }
 
 uint8_t PcMachine::emsReadCallback(void * context, int address)

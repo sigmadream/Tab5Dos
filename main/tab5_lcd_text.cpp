@@ -400,13 +400,31 @@ void emitScreenshotBase64(uint8_t const * buf, size_t len)
 }
 } // namespace
 
-esp_err_t Tab5LcdText::dumpSourceFrameBase64() const
+esp_err_t Tab5LcdText::copySourceFrame(uint16_t * dest,
+                                       size_t capacityPixels,
+                                       int * width,
+                                       int * height) const
 {
+  if (!dest || !width || !height)
+    return ESP_ERR_INVALID_ARG;
   if (!m_lastSource || m_lastSourceWidth <= 0 || m_lastSourceHeight <= 0)
     return ESP_ERR_INVALID_STATE;
+  size_t const pixelCount = static_cast<size_t>(m_lastSourceWidth) * m_lastSourceHeight;
+  if (pixelCount > capacityPixels)
+    return ESP_ERR_INVALID_SIZE;
+  memcpy(dest, m_lastSource, pixelCount * sizeof(uint16_t));
+  *width = m_lastSourceWidth;
+  *height = m_lastSourceHeight;
+  return ESP_OK;
+}
 
-  int const w = m_lastSourceWidth;
-  int const h = m_lastSourceHeight;
+esp_err_t Tab5LcdText::dumpRgb565Base64(uint16_t const * source, int width, int height)
+{
+  if (!source || width <= 0 || height <= 0)
+    return ESP_ERR_INVALID_ARG;
+
+  int const w = width;
+  int const h = height;
   size_t const pixelCount = static_cast<size_t>(w) * h;
   size_t const rawBytes = pixelCount * sizeof(uint16_t);
 
@@ -419,9 +437,9 @@ esp_err_t Tab5LcdText::dumpSourceFrameBase64() const
   size_t rleLen = 0;
   if (rle) {
     for (size_t i = 0; i < pixelCount;) {
-      uint16_t const v = m_lastSource[i];
+      uint16_t const v = source[i];
       size_t run = 1;
-      while (i + run < pixelCount && m_lastSource[i + run] == v && run < 0xffff)
+      while (i + run < pixelCount && source[i + run] == v && run < 0xffff)
         ++run;
       rle[rleLen++] = static_cast<uint8_t>(run & 0xff);
       rle[rleLen++] = static_cast<uint8_t>((run >> 8) & 0xff);
@@ -433,7 +451,7 @@ esp_err_t Tab5LcdText::dumpSourceFrameBase64() const
 
   bool const useRle = rle && rleLen < rawBytes;
   char const * const fmt = useRle ? "rgb565le-rle" : "rgb565le";
-  uint8_t const * const payload = useRle ? rle : reinterpret_cast<uint8_t const *>(m_lastSource);
+  uint8_t const * const payload = useRle ? rle : reinterpret_cast<uint8_t const *>(source);
   size_t const payloadBytes = useRle ? rleLen : rawBytes;
 
   ESP_LOGI(TAG, "screenshot %dx%d fmt=%s payload=%u raw=%u bytes", w, h, fmt,

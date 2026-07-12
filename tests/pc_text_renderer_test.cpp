@@ -15,6 +15,13 @@ int main()
   font['A' * PcTextRenderer::CellHeight + 1] = 0x01; // rightmost pixel
 
   PcTextRenderer renderer;
+
+  uint8_t mutableFont[256 * PcTextRenderer::CellHeight] = {};
+  renderer.setFont({mutableFont, 256});
+  uint64_t const initialFontHash = renderer.stateHash();
+  mutableFont[0] = 0x80;
+  assert(renderer.stateHash() != initialFontHash);
+
   renderer.setFont({font, 256});
   renderer.setBlinkEnabled(true);
   renderer.setFrameCounter(0);
